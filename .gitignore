@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# Виртуальное окружение
+venv/
+.venv/
+
+# Переменные окружения (токен бота)
+.env
+
+# Логи
+*.log
+
+# Данные пользователей бота
+tasks.json
+*.db
+*.sqlite3
+
+# macOS и IDE
+.DS_Store
+.idea/
+.vscode/
