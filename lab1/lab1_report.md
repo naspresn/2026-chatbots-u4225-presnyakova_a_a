@@ -415,7 +415,7 @@ python bot.py
 
 ### Видео-демо
 
-Ссылка: []  
+Ссылка: [https://drive.google.com/file/d/1Cc5uU2QWcKt2acaKM7jE2EDs3UziOQtc/view?usp=sharing]  
 
 ## 6. Трудности и решения
 
