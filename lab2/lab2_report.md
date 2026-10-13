@@ -312,7 +312,7 @@ Date of finished: 13.10.2026
 
 ### Видео-демо
 
-Ссылка: 
+Ссылка: [https://drive.google.com/file/d/1wsGH4vVEZ55_dzHb1arsYG8lF7lYUvUZ/view?usp=sharing]
 
 ## 5. Трудности и решения
 
