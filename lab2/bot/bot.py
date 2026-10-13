@@ -1,0 +1,3572 @@
+"""
+Remindly — личный Telegram-ассистент для задач.
+
+Возможности:
+  • добавление задач (пошаговый диалог /add или просто текстом): приоритет, срок, категория;
+  • управление категориями /categories: число задач, переименование и удаление своих категорий;
+  • редактирование задач /edit: текст, приоритет, срок, категория;
+  • списки /list (с фильтрами) и /today, поиск /find, история выполненных /history
+    (с очисткой: задачи пропадают из истории и поиска, но остаются в статистике);
+  • напоминания о задачах и утренняя сводка (каждый день или только в рабочие дни);
+  • выгрузка /export и загрузка /import задач в CSV-файле, который открывается в Excel;
+  • производственный календарь isdayoff.ru: срок «через N рабочих дней», /workdays;
+  • статистика выполнения.
+
+Данные хранятся в базе SQLite (по умолчанию tasks.db рядом с ботом).
+Задачи из старого tasks.json переносятся в базу автоматически при первом запуске.
+Часовой пояс — Europe/Moscow.
+"""
+
+import calendar
+import csv
+import io
+import json
+import logging
+import os
+import re
+import sqlite3
+import warnings
+from collections import Counter
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import httpx
+from dotenv import load_dotenv
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, TelegramError
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    Defaults,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
+from telegram.warnings import PTBUserWarning
+
+# ---------------------------------------------------------------------------
+# Настройки
+# ---------------------------------------------------------------------------
+
+load_dotenv()  # читаем переменные из файла .env
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def data_path(env_name: str, default: str) -> Path:
+    """Путь из .env. Относительный путь считаем от папки бота, а не от текущей папки."""
+    path = Path(os.getenv(env_name) or default)
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+DB_FILE = data_path("DB_FILE", "tasks.db")        # база SQLite
+JSON_FILE = data_path("DATA_FILE", "tasks.json")  # старый файл: переносится в базу при первом запуске
+CALENDAR_URL = os.getenv("CALENDAR_URL") or "https://isdayoff.ru/api/getdata"
+CALENDAR_TIMEOUT = 5  # сколько секунд ждать ответа производственного календаря
+TZ = ZoneInfo("Europe/Moscow")
+DEFAULT_DIGEST_TIME = "09:00"
+MAX_TASK_LENGTH = 500
+DIALOG_TIMEOUT = 10 * 60  # диалог без ответа завершается через 10 минут
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # не засоряем лог HTTP-запросами
+logging.getLogger("apscheduler").setLevel(logging.WARNING)  # и сообщениями планировщика
+logger = logging.getLogger("remindly")
+
+# ConversationHandler предупреждает о CallbackQueryHandler при per_message=False.
+# Для нашего сценария (один диалог на пользователя) это нормально.
+warnings.filterwarnings("ignore", message=r".*per_message.*", category=PTBUserWarning)
+
+# Приоритеты: ключ хранится в файле, остальное — для отображения и сортировки
+PRIORITIES = {
+    "high": {"emoji": "🔴", "name": "высокий", "button": "🔴 Высокий", "order": 0},
+    "medium": {"emoji": "🟡", "name": "средний", "button": "🟡 Средний", "order": 1},
+    "low": {"emoji": "🟢", "name": "низкий", "button": "🟢 Низкий", "order": 2},
+}
+
+# Базовые категории есть у всех; свои категории пользователя хранятся в базе
+BASE_CATEGORIES = ["Рабочие", "Бытовые", "Учебные", "Личные"]
+MAX_CATEGORY_LENGTH = 30
+
+# Состояния диалогов: добавление задачи (с категорией и сроком в рабочих днях),
+# подтверждение удаления, выбор задачи кнопками, выбор напоминания и вопрос «что найти?»
+(CONFIRM, TEXT, PRIORITY, DUE, DATE_INPUT, DELETE_CONFIRM,
+ PICK_TASK, REMIND_OPTION, REMIND_TIME, DUPLICATE,
+ CATEGORY, WORKDAYS_INPUT, FIND_QUERY,
+ EDIT_FIELD, HISTORY_SCOPE, HISTORY_CONFIRM,
+ CAT_ACTION, CAT_RENAME, CAT_DELETE_CONFIRM) = range(19)
+
+# Данные текущего диалога в context.user_data — всё это забывается при его завершении
+DIALOG_KEYS = ("draft", "delete_id", "pick", "remind_id", "remind_after_add", "remind_prefix",
+               "edit", "clear_scope", "cat_edit")
+
+
+# ---------------------------------------------------------------------------
+# Хранилище: база SQLite
+# ---------------------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id        INTEGER PRIMARY KEY,
+    chat_id        INTEGER NOT NULL,
+    next_id        INTEGER NOT NULL DEFAULT 1,      -- следующий номер задачи
+    digest_enabled INTEGER NOT NULL DEFAULT 1,      -- 1 — утренняя сводка включена
+    digest_time    TEXT    NOT NULL DEFAULT '09:00',
+    digest_mode    TEXT    NOT NULL DEFAULT 'daily'  -- 'daily' или 'workdays'
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    user_id     INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    id          INTEGER NOT NULL,                   -- номер задачи у пользователя: 1, 2, 3…
+    text        TEXT    NOT NULL,
+    priority    TEXT    NOT NULL CHECK (priority IN ('high', 'medium', 'low')),
+    category    TEXT,                               -- NULL — без категории
+    due         TEXT,                               -- срок, ГГГГ-ММ-ДД
+    remind_at   TEXT,                               -- время напоминания, ISO
+    remind_note TEXT,                               -- выбранный вариант: «за сутки до срока»
+    status      TEXT    NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'done')),
+    created_at  TEXT    NOT NULL,
+    done_at     TEXT,
+    archived    INTEGER NOT NULL DEFAULT 0,         -- 1 — убрана из истории (в /stats учитывается)
+    PRIMARY KEY (user_id, id)
+);
+
+-- Свои категории пользователя (базовые — в коде, в BASE_CATEGORIES)
+CREATE TABLE IF NOT EXISTS categories (
+    user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    name    TEXT    NOT NULL,
+    PRIMARY KEY (user_id, name)
+);
+
+-- Служебные отметки, например «задачи из tasks.json уже перенесены»
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+# Поля задачи. По коду задача ходит как обычный словарь с этими ключами
+TASK_FIELDS = ("id", "text", "priority", "category", "due", "remind_at", "remind_note",
+               "status", "created_at", "done_at")
+TASK_COLUMNS = ", ".join(TASK_FIELDS)
+# При чтении задачи берём ещё пометку archived. Записывает её только archive_tasks,
+# поэтому в TASK_FIELDS (вставка и сохранение задачи) её нет.
+TASK_READ_COLUMNS = TASK_COLUMNS + ", archived"
+
+# Колонки, появившиеся в новых версиях бота: в базу от прошлой версии их добавит
+# Database._add_missing_columns (CREATE TABLE IF NOT EXISTS существующую таблицу не меняет)
+NEW_COLUMNS = {
+    "users": {"digest_mode": "TEXT NOT NULL DEFAULT 'daily'"},
+    "tasks": {"archived": "INTEGER NOT NULL DEFAULT 0"},
+}
+
+
+class Database:
+    """Все запросы к базе SQLite — только в этом классе.
+
+    Схема работы в остальном коде такая же простая, как раньше с JSON:
+    загрузили пользователя вместе с задачами (get_user) → поменяли поля задачи →
+    сохранили её (save_task). Каждое изменение сразу записывается в базу.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row  # строки результата можно читать как row["text"]
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        # norm() — для поиска без учёта регистра и «ё». Встроенная LOWER() в SQLite
+        # понимает только латиницу, поэтому подключаем свою функцию из Python.
+        self.conn.create_function("norm", 1, lambda s: normalize(s) if s else "",
+                                  deterministic=True)
+        self.conn.executescript(SCHEMA)
+        self._add_missing_columns()
+
+    def _add_missing_columns(self) -> None:
+        """Обновляет базу, созданную прошлой версией бота: добавляет новые колонки.
+        Данные при этом сохраняются, новые колонки получают значения по умолчанию."""
+        for table, columns in NEW_COLUMNS.items():
+            existing = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for name, definition in columns.items():
+                if name not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                    logger.info("База обновлена: в таблицу %s добавлена колонка %s", table, name)
+        self.conn.commit()
+
+    # --- Служебные отметки -----------------------------------------------------------
+
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    # --- Пользователи ---------------------------------------------------------------
+
+    def find_user(self, user_id: int) -> dict | None:
+        """Пользователь вместе со всеми задачами или None, если его ещё нет."""
+        row = self.conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return self._user_from_row(row) if row else None
+
+    def get_user(self, user_id: int) -> tuple[dict, bool]:
+        """Пользователь (создаётся при первом обращении) и флаг «только что создан»."""
+        user = self.find_user(user_id)
+        if user:
+            return user, False
+        with self.conn:  # with — транзакция: при ошибке изменения откатятся
+            self.conn.execute(
+                "INSERT INTO users (user_id, chat_id, digest_time) VALUES (?, ?, ?)",
+                (user_id, user_id, DEFAULT_DIGEST_TIME),  # в личном чате chat_id = user_id
+            )
+        return self.find_user(user_id), True
+
+    def all_users(self) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM users").fetchall()
+        return [self._user_from_row(row) for row in rows]
+
+    def save_user(self, user: dict) -> None:
+        """Сохраняет chat_id и настройки сводки."""
+        settings = user["settings"]
+        with self.conn:
+            self.conn.execute(
+                "UPDATE users SET chat_id = ?, digest_enabled = ?, digest_time = ?, digest_mode = ? "
+                "WHERE user_id = ?",
+                (user["chat_id"], int(settings["digest_enabled"]), settings["digest_time"],
+                 settings["digest_mode"], user["user_id"]),
+            )
+
+    def _user_from_row(self, row: sqlite3.Row) -> dict:
+        return {
+            "user_id": row["user_id"],
+            "chat_id": row["chat_id"],
+            "next_id": row["next_id"],
+            "settings": {"digest_enabled": bool(row["digest_enabled"]),
+                         "digest_time": row["digest_time"],
+                         "digest_mode": row["digest_mode"]},
+            "tasks": self.tasks(row["user_id"]),
+        }
+
+    # --- Задачи ------------------------------------------------------------------------
+
+    def tasks(self, user_id: int) -> list[dict]:
+        rows = self.conn.execute(
+            f"SELECT {TASK_READ_COLUMNS} FROM tasks WHERE user_id = ? ORDER BY id", (user_id,))
+        return [dict(row) for row in rows]
+
+    def add_task(self, user_id: int, **fields) -> dict:
+        """Новая задача со следующим номером пользователя (номер не переиспользуется)."""
+        with self.conn:
+            return self._insert_task(user_id, **fields)
+
+    def import_tasks(self, user_id: int, tasks: list[dict]) -> list[dict]:
+        """Добавляет много задач в одной транзакции: либо все, либо ни одной."""
+        with self.conn:
+            return [self._insert_task(user_id, **fields) for fields in tasks]
+
+    def _insert_task(self, user_id: int, text: str, priority: str, due: str | None = None,
+                     category: str | None = None, status: str = "active",
+                     created_at: str | None = None, done_at: str | None = None) -> dict:
+        """Вставка без commit — вызывается внутри транзакции add_task или import_tasks."""
+        row = self.conn.execute("SELECT next_id FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        task = {
+            "id": row["next_id"],
+            "text": text,
+            "priority": priority,
+            "category": category,
+            "due": due,
+            "remind_at": None,
+            "remind_note": None,
+            "status": status,
+            "created_at": created_at or now().isoformat(timespec="seconds"),
+            "done_at": done_at,
+        }
+        placeholders = ", ".join("?" for _ in TASK_FIELDS)
+        self.conn.execute(f"INSERT INTO tasks (user_id, {TASK_COLUMNS}) VALUES (?, {placeholders})",
+                          (user_id, *(task[f] for f in TASK_FIELDS)))
+        self.conn.execute("UPDATE users SET next_id = next_id + 1 WHERE user_id = ?", (user_id,))
+        if category:
+            self._remember_category(user_id, category)
+        return {**task, "archived": 0}
+
+    def save_task(self, user_id: int, task: dict) -> None:
+        """Записывает в базу все поля задачи (после того как их поменяли в словаре)."""
+        fields = [f for f in TASK_FIELDS if f != "id"]
+        assignments = ", ".join(f"{f} = ?" for f in fields)
+        with self.conn:
+            self.conn.execute(f"UPDATE tasks SET {assignments} WHERE user_id = ? AND id = ?",
+                              (*(task.get(f) for f in fields), user_id, task["id"]))
+
+    def delete_task(self, user_id: int, task_id: int) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM tasks WHERE user_id = ? AND id = ?", (user_id, task_id))
+
+    def search_tasks(self, user_id: int, words: list[str]) -> list[dict]:
+        """Задачи, в тексте или категории которых есть все слова (без учёта регистра и «ё»).
+        Задачи, убранные из истории, не ищутся."""
+        sql = f"SELECT {TASK_READ_COLUMNS} FROM tasks WHERE user_id = ? AND archived = 0"
+        for _ in words:
+            sql += " AND instr(norm(text || ' ' || coalesce(category, '')), ?) > 0"
+        rows = self.conn.execute(sql, (user_id, *words))
+        return [dict(row) for row in rows]
+
+    def done_history(self, user_id: int, limit: int) -> list[dict]:
+        """Последние выполненные задачи (кроме убранных из истории), самые свежие первыми."""
+        rows = self.conn.execute(
+            f"SELECT {TASK_READ_COLUMNS} FROM tasks WHERE user_id = ? AND status = 'done' "
+            "AND archived = 0 ORDER BY done_at DESC, id DESC LIMIT ?", (user_id, limit))
+        return [dict(row) for row in rows]
+
+    def archive_tasks(self, user_id: int, task_ids: list[int]) -> None:
+        """Убирает задачи из истории и поиска. Из базы они не удаляются — /stats их считает."""
+        with self.conn:
+            self.conn.executemany("UPDATE tasks SET archived = 1 WHERE user_id = ? AND id = ?",
+                                  [(user_id, task_id) for task_id in task_ids])
+
+    # --- Категории ---------------------------------------------------------------------
+
+    def custom_categories(self, user_id: int) -> list[str]:
+        """Свои категории пользователя в порядке создания."""
+        rows = self.conn.execute(
+            "SELECT name FROM categories WHERE user_id = ? ORDER BY rowid", (user_id,))
+        return [row["name"] for row in rows]
+
+    def custom_categories_with_ids(self, user_id: int) -> list[tuple[int, str]]:
+        """Свои категории с номером строки (rowid) — его удобно класть в кнопку."""
+        rows = self.conn.execute(
+            "SELECT rowid, name FROM categories WHERE user_id = ? ORDER BY rowid", (user_id,))
+        return [(row["rowid"], row["name"]) for row in rows]
+
+    def custom_category_name(self, user_id: int, rowid: int) -> str | None:
+        row = self.conn.execute("SELECT name FROM categories WHERE user_id = ? AND rowid = ?",
+                                (user_id, rowid)).fetchone()
+        return row["name"] if row else None
+
+    def add_category(self, user_id: int, name: str) -> None:
+        with self.conn:
+            self._remember_category(user_id, name)
+
+    def rename_category(self, user_id: int, old: str, new: str) -> int:
+        """Переименовывает свою категорию и во всех задачах. Возвращает число изменённых задач."""
+        with self.conn:
+            self.conn.execute("UPDATE categories SET name = ? WHERE user_id = ? AND name = ?",
+                              (new, user_id, old))
+            cursor = self.conn.execute(
+                "UPDATE tasks SET category = ? WHERE user_id = ? AND norm(category) = ?",
+                (new, user_id, normalize(old)))
+            return cursor.rowcount
+
+    def delete_category(self, user_id: int, name: str) -> int:
+        """Удаляет свою категорию; её задачи остаются без категории. Возвращает их число."""
+        with self.conn:
+            self.conn.execute("DELETE FROM categories WHERE user_id = ? AND name = ?", (user_id, name))
+            cursor = self.conn.execute(
+                "UPDATE tasks SET category = NULL WHERE user_id = ? AND norm(category) = ?",
+                (user_id, normalize(name)))
+            return cursor.rowcount
+
+    def _remember_category(self, user_id: int, name: str) -> None:
+        """Запоминает свою категорию. Базовые и уже известные (без учёта регистра) не дублируем."""
+        known = {normalize(c) for c in BASE_CATEGORIES + self.custom_categories(user_id)}
+        if normalize(name) not in known:
+            self.conn.execute("INSERT INTO categories (user_id, name) VALUES (?, ?)", (user_id, name))
+
+    # --- Перенос из tasks.json ---------------------------------------------------------
+
+    def migrate_from_json(self, path: Path) -> None:
+        """Однократно переносит пользователей, настройки и задачи из старого tasks.json.
+
+        После переноса в таблицу meta ставится отметка, чтобы перенос не повторился,
+        а файл переименовывается в tasks.json.migrated — данные из него не удаляются.
+        """
+        if self.get_meta("json_migrated") or not path.exists():
+            return
+        try:
+            users = json.loads(path.read_text(encoding="utf-8"))["users"]
+            moved = skipped = 0
+            with self.conn:  # одна транзакция: при сбое в базу не попадёт половина данных
+                for key, user in users.items():
+                    user_id = int(key)
+                    settings = user.get("settings", {})
+                    tasks = user.get("tasks", [])
+                    # следующий номер — больше всех существующих, чтобы номера не повторялись
+                    next_id = max([user.get("next_id", 1)] + [t.get("id", 0) + 1 for t in tasks])
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO users (user_id, chat_id, next_id, digest_enabled, "
+                        "digest_time) VALUES (?, ?, ?, ?, ?)",
+                        (user_id, user.get("chat_id", user_id), next_id,
+                         int(settings.get("digest_enabled", True)),
+                         settings.get("digest_time", DEFAULT_DIGEST_TIME)),
+                    )
+                    for task in tasks:
+                        values = {f: task.get(f) for f in TASK_FIELDS}
+                        values["status"] = values["status"] or "active"
+                        values["created_at"] = values["created_at"] or now().isoformat(timespec="seconds")
+                        placeholders = ", ".join("?" for _ in TASK_FIELDS)
+                        try:
+                            self.conn.execute(
+                                f"INSERT INTO tasks (user_id, {TASK_COLUMNS}) VALUES (?, {placeholders})",
+                                (user_id, *(values[f] for f in TASK_FIELDS)))
+                            moved += 1
+                        except sqlite3.IntegrityError as e:  # повреждённая запись или повтор номера
+                            logger.warning("Задача %s пользователя %s не перенесена: %s",
+                                           task.get("id"), user_id, e)
+                            skipped += 1
+                self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                                  ("json_migrated", now().isoformat(timespec="seconds")))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, sqlite3.Error) as e:
+            logger.error("Не удалось перенести задачи из %s: %s. Файл оставлен как есть.", path, e)
+            return
+        logger.info("Из %s перенесено задач: %d, пропущено: %d", path.name, moved, skipped)
+        try:
+            path.rename(path.with_name(path.name + ".migrated"))
+        except OSError as e:
+            logger.warning("Не удалось переименовать %s: %s", path, e)
+
+
+try:
+    db = Database(DB_FILE)
+except sqlite3.Error as e:
+    raise SystemExit(f"Не удалось открыть базу {DB_FILE}: {e}") from e
+
+
+# ---------------------------------------------------------------------------
+# Вспомогательные функции: время, разбор ввода, форматирование
+# ---------------------------------------------------------------------------
+
+def now() -> datetime:
+    return datetime.now(TZ)
+
+
+def today() -> date:
+    return now().date()
+
+
+def parse_date(text: str) -> date | None:
+    """«14.10» или «14.10.2026» -> date.
+
+    Без года выбираем дату, ближайшую к сегодняшнему дню, — в этом или следующем году.
+    Например, 20 декабря «10.01» — это 10 января следующего года,
+    а 12 октября «01.10» — 1 октября этого года (уже прошло).
+    """
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?", text.strip())
+    if not m:
+        return None
+    day, month = int(m[1]), int(m[2])
+    years = [int(m[3])] if m[3] else [today().year, today().year + 1]
+    candidates = []
+    for year in years:
+        try:
+            candidates.append(date(year, month, day))
+        except ValueError:  # например, 31.02 или 29.02 в невисокосный год
+            pass
+    if not candidates:
+        return None
+    return min(candidates, key=lambda d: abs((d - today()).days))
+
+
+def parse_time(text: str) -> time | None:
+    """«18:30» -> time."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", text.strip())
+    if not m:
+        return None
+    hour, minute = int(m[1]), int(m[2])
+    if hour > 23 or minute > 59:
+        return None
+    return time(hour, minute)
+
+
+def fmt_date(d: date) -> str:
+    """Дата коротко: «14.10», а для другого года — «14.10.2027»."""
+    return d.strftime("%d.%m") if d.year == today().year else d.strftime("%d.%m.%Y")
+
+
+def fmt_when(dt: datetime) -> str:
+    """Момент напоминания по-человечески: «сегодня в 18:30», «завтра в 09:00», «14.10 в 18:30»."""
+    d = dt.date()
+    if d == today():
+        day = "сегодня"
+    elif d == today() + timedelta(days=1):
+        day = "завтра"
+    else:
+        day = fmt_date(d)
+    return f"{day} в {dt.strftime('%H:%M')}"
+
+
+WEEKDAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+MONTHS_GENITIVE = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+                   "сентября", "октября", "ноября", "декабря"]
+MONTHS_PREPOSITIONAL = ["январе", "феврале", "марте", "апреле", "мае", "июне", "июле", "августе",
+                        "сентябре", "октябре", "ноябре", "декабре"]
+
+
+def fmt_day(d: date) -> str:
+    """Дата с днём недели: «14.10 (ср)»."""
+    return f"{fmt_date(d)} ({WEEKDAYS[d.weekday()]})"
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """Слово в нужной форме для числа: 1 задача, 2 задачи, 5 задач."""
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+MESSAGE_LIMIT = 3800  # Telegram принимает до 4096 символов в сообщении — оставляем запас
+
+
+def join_lines(header: str, lines: list[str]) -> str:
+    """Заголовок и строки списка. Если всё не помещается в одно сообщение — обрезаем с пометкой."""
+    text = header
+    for i, line in enumerate(lines):
+        if len(text) + len(line) + 30 > MESSAGE_LIMIT:
+            return f"{text}\n… и ещё {len(lines) - i}"
+        text += f"\n{line}"
+    return text
+
+
+def task_due(task: dict) -> date | None:
+    return date.fromisoformat(task["due"]) if task.get("due") else None
+
+
+def is_overdue(task: dict) -> bool:
+    due = task_due(task)
+    return task["status"] == "active" and due is not None and due < today()
+
+
+def task_line(task: dict, show_id: bool = True) -> str:
+    """Строка задачи: «#3 🔴 Подготовить отчёт · 🏷 Учебные · до 14.10 ⚠️ просрочено»."""
+    line = f"{PRIORITIES[task['priority']]['emoji']} {task['text']}"
+    if show_id:
+        line = f"#{task['id']} {line}"
+    if task.get("category"):
+        line += f" · 🏷 {task['category']}"
+    due = task_due(task)
+    if due:
+        line += f" · до {fmt_date(due)}"
+    if is_overdue(task):
+        line += " ⚠️ просрочено"
+    return line
+
+
+def sort_key(task: dict):
+    """Порядок: просроченные -> приоритет (высокий первым) -> срок (без срока в конце) -> номер."""
+    return (
+        0 if is_overdue(task) else 1,
+        PRIORITIES[task["priority"]]["order"],
+        task_due(task) or date.max,
+        task["id"],
+    )
+
+
+def active_tasks(user: dict) -> list[dict]:
+    return sorted((t for t in user["tasks"] if t["status"] == "active"), key=sort_key)
+
+
+def today_tasks(user: dict) -> list[dict]:
+    """Активные задачи со сроком на сегодня и просроченные."""
+    return [t for t in active_tasks(user) if task_due(t) and task_due(t) <= today()]
+
+
+def find_task(user: dict, task_id: int) -> dict | None:
+    return next((t for t in user["tasks"] if t["id"] == task_id), None)
+
+
+def parse_task_id(arg: str) -> int | None:
+    """«3» или «#3» -> 3."""
+    arg = arg.lstrip("#")
+    return int(arg) if arg.isdigit() else None
+
+
+def get_user(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> dict:
+    """Данные пользователя. Для нового пользователя сразу включаем ежедневную сводку."""
+    user, created = db.get_user(user_id)
+    if created:
+        schedule_digest(context.job_queue, user_id, user)
+    return user
+
+
+# ---------------------------------------------------------------------------
+# Планировщик: напоминания и ежедневная сводка
+# ---------------------------------------------------------------------------
+
+def reminder_job_name(user_id: int, task_id: int) -> str:
+    return f"remind:{user_id}:{task_id}"
+
+
+def digest_job_name(user_id: int) -> str:
+    return f"digest:{user_id}"
+
+
+def cancel_jobs(job_queue, name: str) -> None:
+    for job in job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+
+
+def schedule_reminder(job_queue, user_id: int, task: dict) -> None:
+    """Ставит (или переставляет) напоминание по полю task["remind_at"]."""
+    name = reminder_job_name(user_id, task["id"])
+    cancel_jobs(job_queue, name)
+    if not task.get("remind_at") or task["status"] != "active":
+        return
+    when = datetime.fromisoformat(task["remind_at"])
+    # Если напоминание пропущено, пока бот был выключен, — отправим его сразу
+    when = max(when, now() + timedelta(seconds=5))
+    job_queue.run_once(
+        reminder_job, when, name=name, data={"user_id": user_id, "task_id": task["id"]}
+    )
+
+
+def schedule_digest(job_queue, user_id: int, user: dict) -> None:
+    """Ставит ежедневную сводку на время из настроек (или снимает, если сводка выключена)."""
+    name = digest_job_name(user_id)
+    cancel_jobs(job_queue, name)
+    settings = user["settings"]
+    if not settings.get("digest_enabled"):
+        return
+    t = parse_time(settings.get("digest_time", DEFAULT_DIGEST_TIME)) or parse_time(DEFAULT_DIGEST_TIME)
+    job_queue.run_daily(
+        digest_job, t.replace(tzinfo=TZ), name=name, data={"user_id": user_id}
+    )
+
+
+def reminder_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Выполнено", callback_data=f"rdone:{task_id}"),
+        InlineKeyboardButton("⏰ Отложить на 1 час", callback_data=f"snooze:{task_id}"),
+    ]])
+
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Срабатывание напоминания."""
+    user_id = context.job.data["user_id"]
+    user = db.find_user(user_id)
+    task = find_task(user, context.job.data["task_id"]) if user else None
+    if not task or task["status"] != "active":
+        return  # задачу успели удалить или выполнить
+    task["remind_at"] = None
+    task["remind_note"] = None
+    db.save_task(user_id, task)
+    try:
+        await context.bot.send_message(
+            user["chat_id"],
+            f"⏰ Напоминание\n{task_line(task)}",
+            reply_markup=reminder_keyboard(task["id"]),
+        )
+    except TelegramError as e:  # например, пользователь заблокировал бота
+        logger.warning("Не удалось отправить напоминание %s: %s", user_id, e)
+
+
+async def digest_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ежедневная сводка: задачи на сегодня и просроченные."""
+    user_id = context.job.data["user_id"]
+    user = db.find_user(user_id)
+    if not user:
+        return
+    if user["settings"]["digest_mode"] == "workdays":
+        # Если календарь недоступен, is_day_off считает нерабочими только субботу и воскресенье
+        day_off, _ = await is_day_off(today())
+        if day_off:
+            logger.info("Сводка для %s пропущена: сегодня нерабочий день", user_id)
+            return
+    tasks = today_tasks(user)
+    if tasks:
+        text = join_lines("☀️ Доброе утро! Задачи на сегодня:\n", [task_line(t) for t in tasks])
+    else:
+        text = "☀️ Доброе утро! На сегодня задач нет 🎉"
+    try:
+        await context.bot.send_message(user["chat_id"], text)
+    except TelegramError as e:
+        logger.warning("Не удалось отправить сводку %s: %s", user_id, e)
+
+
+def restore_jobs(application: Application) -> None:
+    """После перезапуска восстанавливаем сводки и напоминания из базы."""
+    reminders = 0
+    users = db.all_users()
+    for user in users:
+        user_id = user["user_id"]
+        schedule_digest(application.job_queue, user_id, user)
+        for task in user["tasks"]:
+            if task["status"] == "active" and task.get("remind_at"):
+                schedule_reminder(application.job_queue, user_id, task)
+                reminders += 1
+    logger.info("Восстановлено: пользователей %d, напоминаний %d", len(users), reminders)
+
+
+# ---------------------------------------------------------------------------
+# Производственный календарь (isdayoff.ru)
+# ---------------------------------------------------------------------------
+# Запрос «?year=2026» возвращает строку из 365 (366) цифр — по одной на каждый день года:
+# «0» — рабочий день, «1» — выходной или праздник. Ответ кэшируем: календарь на год
+# меняется редко, а сервис не стоит дёргать на каждый вопрос.
+# Если сервис недоступен, бот не ломается: выходными считает только субботу и воскресенье
+# и честно пишет об этом пользователю (CALENDAR_FALLBACK_NOTE).
+
+CALENDAR_CACHE_TTL = timedelta(hours=12)   # сколько хранить загруженный год
+CALENDAR_RETRY_AFTER = timedelta(minutes=5)  # после ошибки не повторяем запрос сразу
+CALENDAR_FALLBACK_NOTE = ("⚠️ Производственный календарь сейчас недоступен — "
+                          "выходными считаю только субботу и воскресенье, праздники не учитываю.")
+
+# год -> (строка «0»/«1» по дням или None, если загрузить не удалось; когда загружали)
+_calendar_cache: dict[int, tuple[str | None, datetime]] = {}
+
+
+async def load_calendar_year(year: int) -> str | None:
+    """Дни года из производственного календаря («0» — рабочий, «1» — нерабочий) или None."""
+    cached = _calendar_cache.get(year)
+    if cached:
+        days, loaded_at = cached
+        ttl = CALENDAR_CACHE_TTL if days else CALENDAR_RETRY_AFTER
+        if now() - loaded_at < ttl:
+            return days
+
+    days = None
+    try:
+        async with httpx.AsyncClient(timeout=CALENDAR_TIMEOUT) as client:
+            response = await client.get(CALENDAR_URL, params={"year": year, "cc": "ru"})
+        response.raise_for_status()  # 404 — например, на этот год данных ещё нет
+        text = response.text.strip()
+        expected_length = 366 if calendar.isleap(year) else 365
+        if len(text) != expected_length or not text.isdigit():
+            raise ValueError(f"неожиданный ответ: {text[:30]!r}")
+        days = text
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError) as e:
+        # Нет интернета, сервис не отвечает, неверный адрес в .env — бот продолжает работать
+        logger.warning("Производственный календарь на %s год недоступен: %s", year, e)
+    _calendar_cache[year] = (days, now())
+    return days
+
+
+async def is_day_off(d: date) -> tuple[bool, bool]:
+    """(нерабочий ли день, взят ли ответ из производственного календаря).
+    Если календарь недоступен, нерабочими считаются только суббота и воскресенье."""
+    days = await load_calendar_year(d.year)
+    if days is None:
+        return d.weekday() >= 5, False
+    return days[d.timetuple().tm_yday - 1] == "1", True
+
+
+async def add_workdays(start: date, count: int) -> tuple[date, bool]:
+    """Дата через count рабочих дней после start (сам start не считается).
+    Возвращает дату и признак, что все дни взяты из производственного календаря."""
+    d, left, from_calendar = start, count, True
+    while left > 0:
+        d += timedelta(days=1)
+        day_off, from_api = await is_day_off(d)
+        from_calendar = from_calendar and from_api
+        if not day_off:
+            left -= 1
+    return d, from_calendar
+
+
+async def day_off_warning(due: date | None) -> str:
+    """Предупреждение, если срок выпадает на выходной или праздник; '' — если всё в порядке."""
+    if due is None or due < today():
+        return ""
+    day_off, from_calendar = await is_day_off(due)
+    text = ""
+    if day_off:
+        kind = "выходной день" if due.weekday() >= 5 else "праздник, нерабочий день"
+        text += f"\n⚠️ {fmt_day(due)} — {kind}."
+    if not from_calendar:
+        text += f"\n{CALENDAR_FALLBACK_NOTE}"
+    return text
+
+
+async def workdays_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/workdays — сколько рабочих дней осталось до конца месяца."""
+    start = today()
+    last = start.replace(day=calendar.monthrange(start.year, start.month)[1])
+    total = left = 0
+    today_off, from_calendar = False, True
+    d = start.replace(day=1)
+    while d <= last:
+        day_off, from_api = await is_day_off(d)
+        from_calendar = from_calendar and from_api
+        if d == start:
+            today_off = day_off
+        if not day_off:
+            total += 1
+            if d >= start:
+                left += 1
+        d += timedelta(days=1)
+
+    month_gen = MONTHS_GENITIVE[start.month - 1]
+    verb = "остался" if plural(left, "1", "2", "5") == "1" else "осталось"
+    text = (f"📅 До конца {month_gen} {verb} {left} "
+            f"{plural(left, 'рабочий день', 'рабочих дня', 'рабочих дней')}")
+    text += " (сегодня выходной)." if today_off else " (включая сегодня)."
+    text += (f"\nВсего в {MONTHS_PREPOSITIONAL[start.month - 1]} {total} "
+             f"{plural(total, 'рабочий день', 'рабочих дня', 'рабочих дней')}.")
+    if not from_calendar:
+        text += f"\n\n{CALENDAR_FALLBACK_NOTE}"
+    await update.message.reply_text(text)
+
+
+# ---------------------------------------------------------------------------
+# Диалоги: добавление задачи (/add, быстрое добавление) и подтверждение /delete
+# ---------------------------------------------------------------------------
+
+PRIORITY_KEYBOARD = InlineKeyboardMarkup([[
+    InlineKeyboardButton(p["button"], callback_data=f"prio:{key}") for key, p in PRIORITIES.items()
+]])
+
+DUE_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Сегодня", callback_data="due:today"),
+     InlineKeyboardButton("Завтра", callback_data="due:tomorrow")],
+    [InlineKeyboardButton("Без срока", callback_data="due:none"),
+     InlineKeyboardButton("Указать дату", callback_data="due:custom")],
+    [InlineKeyboardButton("Через N рабочих дней", callback_data="due:workdays")],
+])
+
+# Текстовые ответы вместо кнопок: вариант -> значение (сравниваются через match_phrase)
+YES_NO_WORDS = {"да": True, "ок": True, "добавить": True, "нет": False, "отмена": False}
+DUPLICATE_WORDS = {**YES_NO_WORDS, "создать": True, "сохранить": True}
+DELETE_WORDS = {**YES_NO_WORDS, "удалить": True, "оставить": False}
+PRIORITY_WORDS = {p["name"]: key for key, p in PRIORITIES.items()}  # «высокий» -> "high"
+DUE_WORDS = {"сегодня": "today", "завтра": "tomorrow", "без срока": "none", "указать дату": "custom",
+             "через n рабочих дней": "workdays", "рабочие дни": "workdays"}
+
+# Подсказки, если текстовый ответ не распознан
+YES_NO_HINT = "Напишите «да» или «нет», либо нажмите кнопку."
+PRIORITY_HINT = "Напишите: высокий, средний или низкий, либо нажмите кнопку."
+DUE_HINT = ("Напишите: сегодня, завтра, без срока, дату ДД.ММ или «через 5 рабочих дней», "
+            "либо нажмите кнопку.")
+
+
+def normalize(text: str) -> str:
+    """Готовит ответ к сравнению: нижний регистр, ё -> е, без лишних пробелов
+    и знаков препинания в конце («Привет!» -> «привет»)."""
+    return " ".join(text.lower().replace("ё", "е").split()).rstrip(".,!?;:…").strip()
+
+
+# --- Опечатки ------------------------------------------------------------------
+
+# Раскладка ЙЦУКЕН: ряды клавиш и их сдвиг вправо относительно верхнего ряда
+KEYBOARD_ROWS = [("йцукенгшщзхъ", 0.0), ("фывапролджэ", 0.25), ("ячсмитьбю", 0.75)]
+KEY_POSITIONS = {
+    key: (row, index + shift)
+    for row, (keys, shift) in enumerate(KEYBOARD_ROWS)
+    for index, key in enumerate(keys)
+}
+
+
+def keys_adjacent(a: str, b: str) -> bool:
+    """Соседние ли клавиши: рядом в одном ряду или касаются в соседнем ряду («а» — «п», «а» — «к»)."""
+    if a not in KEY_POSITIONS or b not in KEY_POSITIONS:
+        return False
+    (row_a, x_a), (row_b, x_b) = KEY_POSITIONS[a], KEY_POSITIONS[b]
+    if row_a == row_b:
+        return abs(x_a - x_b) == 1
+    return abs(row_a - row_b) == 1 and abs(x_a - x_b) < 1
+
+
+def substitution_cost(a: str, b: str) -> int:
+    """Цена замены буквы: своя — 0, соседняя клавиша — 1 опечатка, далёкая — 2."""
+    if a == b:
+        return 0
+    return 1 if keys_adjacent(a, b) else 2
+
+
+def edit_distance(a: str, b: str) -> int:
+    """Сколько опечаток отделяет a от b с учётом клавиатуры.
+
+    Одна опечатка: пропущенная или лишняя буква («звтра»), перестановка двух соседних
+    букв («срдений») или нажатие соседней клавиши («зпвтра»: «п» рядом с «а»).
+    Буква, заменённая на далёкую клавишу, считается за две опечатки:
+    поэтому «помочь» не путается с «помощь» — «ч» и «щ» на клавиатуре далеко.
+    """
+    prev2, prev = None, list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = substitution_cost(a[i - 1], b[j - 1])
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+def typo_limit(word: str) -> int:
+    """Сколько опечаток допускаем в слове. Короткие («да», «нет», «ок», «лист») — только точно:
+    в них одна опечатка уже даёт другое слово («лиса» — не «лист»)."""
+    if len(word) <= 4:
+        return 0
+    return 1 if len(word) <= 7 else 2
+
+
+def match_phrase(text: str, options: dict):
+    """Ищет в options фразу, совпадающую с text с учётом небольших опечаток.
+
+    Слова сравниваются по отдельности, количество слов должно совпадать.
+    Возвращает значение найденного варианта или None, если ничего не подошло
+    или подошли разные варианты одинаково хорошо.
+    """
+    text = normalize(text)
+    if text in options:
+        return options[text]
+    words = text.split()
+    best, best_distance, ambiguous = None, None, False
+    for phrase, value in options.items():
+        phrase_words = phrase.split()
+        if len(phrase_words) != len(words):
+            continue
+        distances = [edit_distance(w, p) for w, p in zip(words, phrase_words)]
+        if any(d > typo_limit(p) for d, p in zip(distances, phrase_words)):
+            continue
+        distance = sum(distances)
+        if best_distance is None or distance < best_distance:
+            best, best_distance, ambiguous = value, distance, False
+        elif distance == best_distance and value != best:
+            ambiguous = True
+    return None if ambiguous else best
+
+
+# --- Команды обычным текстом ------------------------------------------------------
+
+# Команды без аргументов: фраза -> (команда, аргументы)
+TEXT_COMMANDS = {
+    "список": ("list", []),
+    "лист": ("list", []),
+    "задачи": ("list", []),
+    "мои задачи": ("list", []),
+    "сегодня": ("today", []),
+    "на сегодня": ("today", []),
+    "напоминания": ("reminders", []),
+    "статистика": ("stats", []),
+    "помощь": ("help", []),
+    "команды": ("help", []),
+    "сводка": ("digest", []),
+    "сводка вкл": ("digest", ["on"]),
+    "сводка выкл": ("digest", ["off"]),
+    "сводка рабочие": ("digest", ["рабочие"]),
+    "сводка рабочие дни": ("digest", ["рабочие"]),
+    "сводка каждый день": ("digest", ["каждый", "день"]),
+    "сводка ежедневно": ("digest", ["каждый", "день"]),
+    "добавить": ("add", []),
+    "отмена": ("cancel", []),
+    # Без номера — бот покажет задачи кнопками
+    "готово": ("done", []),
+    "выполнено": ("done", []),
+    "сделано": ("done", []),
+    "удалить": ("delete", []),
+    "напомни": ("remind", []),
+    "напомнить": ("remind", []),
+    "изменить": ("edit", []),
+    "редактировать": ("edit", []),
+    # Поиск, история, файлы, календарь
+    "найти": ("find", []),
+    "найди": ("find", []),
+    "поиск": ("find", []),
+    "история": ("history", []),
+    "выполненные": ("history", []),
+    "очистить историю": ("clear_history", []),
+    "очистить всю историю": ("clear_history", ["все"]),
+    "экспорт": ("export", []),
+    "выгрузить": ("export", []),
+    "выгрузка": ("export", []),
+    "импорт": ("import", []),
+    "загрузить": ("import", []),
+    "загрузка": ("import", []),
+    "рабочие дни": ("workdays", []),
+    "категории": ("categories", []),
+    "мои категории": ("categories", []),
+    # Приветствия — отвечаем как на /start, а не предлагаем сохранить задачу
+    "привет": ("start", []),
+    "приветик": ("start", []),
+    "здравствуй": ("start", []),
+    "здравствуйте": ("start", []),
+    "добрый день": ("start", []),
+    "доброе утро": ("start", []),
+    "добрый вечер": ("start", []),
+    "хай": ("start", []),
+    "салют": ("start", []),
+    "hi": ("start", []),
+    "hello": ("start", []),
+    "начать": ("start", []),
+    "старт": ("start", []),
+}
+
+# Команды с аргументами: первое слово -> (команда, шаблон для остальной части сообщения)
+TASK_ID_RE = r"#?\d+"
+TIME_RE = r"\d{1,2}:\d{2}"
+DATE_RE = r"\d{1,2}\.\d{1,2}(?:\.\d{4})?"
+REMIND_RE = rf"{TASK_ID_RE}(?: (?:{DATE_RE} )?{TIME_RE})?"
+TEXT_COMMANDS_WITH_ARGS = {
+    "добавить": ("add", r".+"),
+    "готово": ("done", TASK_ID_RE),
+    "выполнено": ("done", TASK_ID_RE),
+    "сделано": ("done", TASK_ID_RE),
+    "удалить": ("delete", TASK_ID_RE),
+    "изменить": ("edit", TASK_ID_RE),
+    "редактировать": ("edit", TASK_ID_RE),
+    "напомни": ("remind", REMIND_RE),
+    "напомнить": ("remind", REMIND_RE),
+    "сводка": ("digest", TIME_RE),
+    "найти": ("find", r".+"),
+    "найди": ("find", r".+"),
+    "поиск": ("find", r".+"),
+    # «список рабочие», «список высокий», «список неделя» — фильтр проверяется отдельно,
+    # чтобы «Список покупок» оставался задачей
+    "список": ("list", None),
+    "лист": ("list", None),
+    "задачи": ("list", None),
+}
+
+
+def parse_text_command(text: str, user_id: int | None = None) -> tuple[str, list[str]] | None:
+    """«Лист» -> ("list", []), «удалить 3» -> ("delete", ["3"]), «список рабочие» -> ("list", ["рабочие"]).
+
+    Командой считается только сообщение, которое целиком совпадает с вариантом:
+    «Список покупок» или «Сегодня позвонить маме» — это задачи, а не команды.
+    user_id нужен, чтобы узнать категории пользователя для «список <категория>».
+    """
+    command = match_phrase(text, TEXT_COMMANDS)
+    if command:
+        return command
+    words = text.split()
+    if len(words) < 2:
+        return None
+    verb = match_phrase(words[0], TEXT_COMMANDS_WITH_ARGS)
+    if not verb:
+        return None
+    name, pattern = verb
+    if name in ("add", "find"):
+        return name, words[1:]  # текст задачи или запроса сохраняем как есть, с регистром
+    if name == "list":
+        wanted = " ".join(words[1:])
+        if user_id is not None and match_phrase(wanted, list_filter_options(user_id)) is not None:
+            return name, words[1:]
+        return None
+    rest = normalize(" ".join(words[1:]))
+    if re.fullmatch(pattern, rest):
+        return name, rest.split()
+    return None
+
+
+async def run_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           command: tuple[str, list[str]]) -> int:
+    """Выполняет текстовую команду так же, как команду со слешем.
+    Если шёл диалог, он молча завершается. Возвращает новое состояние диалога."""
+    name, args = command
+    context.args = args
+    # Исходный текст: /find подскажет, как добавить «Найти ключи» задачей, если поиск пустой
+    context.user_data["text_command_source"] = update.message.text.strip()
+    try:
+        if name in DIALOG_COMMAND_HANDLERS:  # /add, /edit, /done, /delete, /remind, /find, /cancel…
+            return await DIALOG_COMMAND_HANDLERS[name](update, context)
+        await end_dialog_quietly(context)
+        await COMMAND_HANDLERS[name](update, context)
+        return ConversationHandler.END
+    finally:
+        context.user_data.pop("text_command_source", None)
+
+
+async def try_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    """Если сообщение — текстовая команда, выполняет её и возвращает новое состояние, иначе None."""
+    command = parse_text_command(update.message.text, update.effective_user.id)
+    if command is None:
+        return None
+    return await run_text_command(update, context, command)
+
+
+def validate_task_text(text: str) -> str | None:
+    """Возвращает сообщение об ошибке или None, если текст подходит."""
+    if not text.strip():
+        return "Текст задачи пустой. Напишите, что нужно сделать."
+    if len(text) > MAX_TASK_LENGTH:
+        return f"Слишком длинно (больше {MAX_TASK_LENGTH} символов). Сократите, пожалуйста."
+    return None
+
+
+async def drop_keyboard(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Убирает кнопки из последнего вопроса диалога (например, когда ответили текстом)."""
+    kb_message = context.user_data.pop("kb_message", None)
+    if not kb_message:
+        return
+    chat_id, message_id = kb_message
+    try:
+        await context.bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+    except TelegramError:
+        pass  # сообщение удалено или кнопок там уже нет — не страшно
+
+
+async def respond(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
+                  keyboard: InlineKeyboardMarkup | None = None) -> None:
+    """Ответ на шаге диалога.
+
+    Нажата кнопка — редактируем это же сообщение.
+    Пришёл текст — убираем кнопки из прошлого вопроса и отправляем новое сообщение.
+    Сообщение с кнопками запоминаем, чтобы потом их можно было убрать.
+    """
+    query = update.callback_query
+    if query:
+        await query.edit_message_text(text, reply_markup=keyboard)
+        message_key = (query.message.chat_id, query.message.message_id)
+        if keyboard:
+            context.user_data["kb_message"] = message_key
+        elif context.user_data.get("kb_message") == message_key:
+            context.user_data.pop("kb_message")
+    else:
+        await drop_keyboard(context)
+        message = await update.message.reply_text(text, reply_markup=keyboard)
+        if keyboard:
+            context.user_data["kb_message"] = (message.chat_id, message.message_id)
+
+
+async def end_dialog_quietly(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Молча завершает текущий диалог: забываем его данные и убираем кнопки."""
+    for key in DIALOG_KEYS:
+        context.user_data.pop(key, None)
+    await drop_keyboard(context)
+
+
+# --- Добавление задачи -------------------------------------------------------
+
+async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/add — начало диалога. Можно сразу: /add Купить хлеб."""
+    get_user(context, update.effective_user.id)
+    await end_dialog_quietly(context)  # /add посреди диалога начинает заново
+    context.user_data["draft"] = {}
+    text = " ".join(context.args or []).strip()
+    if text:
+        error = validate_task_text(text)
+        if error:
+            await update.message.reply_text(error)
+            return ConversationHandler.END
+        return await start_new_task(update, context, text, ask_confirm=False)
+    await update.message.reply_text("📝 Напишите текст задачи (или /cancel для отмены).")
+    return TEXT
+
+
+async def add_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Шаг 1: получили текст задачи.
+    Здесь любой текст подходит как ответ, поэтому сначала проверяем текстовые команды
+    («список», «отмена»): иначе из них получились бы задачи."""
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    text = update.message.text.strip()
+    error = validate_task_text(text)
+    if error:
+        await update.message.reply_text(error)
+        return TEXT
+    if editing(context):
+        return await edit_text_entered(update, context, text)
+    return await start_new_task(update, context, text, ask_confirm=False)
+
+
+async def quick_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Быстрое добавление: пользователь просто написал текст вне диалога."""
+    get_user(context, update.effective_user.id)
+    state = await try_text_command(update, context)  # «лист», «удалить 3» и т. п.
+    if state is not None:
+        return state
+    text = update.message.text.strip()
+    if normalize(text) in YES_NO_WORDS:
+        # «да», «нет», «ок» без вопроса — это не задача
+        await update.message.reply_text("Чтобы добавить задачу, напишите её текст.")
+        return ConversationHandler.END
+    error = validate_task_text(text)
+    if error:
+        await update.message.reply_text(error)
+        return ConversationHandler.END
+    return await start_new_task(update, context, text, ask_confirm=True)
+
+
+QUICK_KEYBOARD = InlineKeyboardMarkup([[
+    InlineKeyboardButton("Добавить", callback_data="quick:yes"),
+    InlineKeyboardButton("Отмена", callback_data="quick:no"),
+]])
+
+DUPLICATE_KEYBOARD = InlineKeyboardMarkup([[
+    InlineKeyboardButton("Создать", callback_data="dup:yes"),
+    InlineKeyboardButton("Отмена", callback_data="dup:no"),
+]])
+
+
+def find_duplicate(user: dict, text: str, exclude_id: int | None = None) -> dict | None:
+    """Активная задача с тем же текстом — без учёта регистра, лишних пробелов
+    и знаков препинания в конце. Выполненные задачи не сравниваем.
+    exclude_id — номер редактируемой задачи: сама с собой она не «повторяется»."""
+    key = normalize(text)
+    return next((t for t in active_tasks(user)
+                  if normalize(t["text"]) == key and t["id"] != exclude_id), None)
+
+
+async def start_new_task(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         text: str, ask_confirm: bool) -> int:
+    """Текст задачи получен (/add, /add <текст> или быстрое добавление).
+
+    Если такая активная задача уже есть — спрашиваем, создавать ли повтор
+    (при быстром добавлении этот вопрос заменяет «Сохранить как задачу?»).
+    Иначе быстрое добавление спрашивает «Сохранить как задачу?», а /add — сразу приоритет.
+    """
+    context.user_data["draft"] = {"text": text}
+    duplicate = find_duplicate(get_user(context, update.effective_user.id), text)
+    if duplicate:
+        line = task_line(duplicate)
+        dot = "" if line.endswith((".", "!", "?", "…")) else "."  # без «ТЕСТ!.»
+        await respond(update, context, f"Такая задача уже есть: {line}{dot} Всё равно создать?",
+                      DUPLICATE_KEYBOARD)
+        return DUPLICATE
+    if ask_confirm:
+        await respond(update, context, f"Сохранить как задачу?\n«{text}»", QUICK_KEYBOARD)
+        return CONFIRM
+    await respond(update, context, "Какой приоритет?", PRIORITY_KEYBOARD)
+    return PRIORITY
+
+
+async def duplicate_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Кнопки «Создать» / «Отмена» под вопросом о повторе."""
+    query = update.callback_query
+    await query.answer()
+    return await duplicate_answer(update, context, query.data == "dup:yes")
+
+
+async def duplicate_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ответ текстом на «Всё равно создать?»: «да», «создать», «нет», «отмена»…"""
+    yes = match_phrase(update.message.text, DUPLICATE_WORDS)
+    if yes is not None:
+        return await duplicate_answer(update, context, yes)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(YES_NO_HINT)
+    return DUPLICATE
+
+
+async def duplicate_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, yes: bool) -> int:
+    """Создаём повтор (дальше — приоритет и срок) или отменяем.
+    При редактировании «да» сохраняет новый текст задачи."""
+    if editing(context):
+        if yes:
+            return await finish_edit(update, context, {"text": context.user_data["draft"]["text"]})
+        for key in ("edit", "draft"):
+            context.user_data.pop(key, None)
+        await respond(update, context, "Ок, задача не изменена.")
+        return ConversationHandler.END
+    if not yes:
+        context.user_data.pop("draft", None)
+        await respond(update, context, "Ок, не создаю.")
+        return ConversationHandler.END
+    text = context.user_data["draft"]["text"]
+    await respond(update, context, f"📝 «{text}»\nКакой приоритет?", PRIORITY_KEYBOARD)
+    return PRIORITY
+
+
+async def quick_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Кнопки «Добавить» / «Отмена»."""
+    query = update.callback_query
+    await query.answer()
+    return await quick_answer(update, context, query.data == "quick:yes")
+
+
+async def quick_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ответ текстом на «Сохранить как задачу?». Сначала — ответ, затем — текстовая команда."""
+    yes = match_phrase(update.message.text, YES_NO_WORDS)
+    if yes is not None:
+        return await quick_answer(update, context, yes)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(YES_NO_HINT)
+    return CONFIRM
+
+
+async def quick_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, yes: bool) -> int:
+    """Общая логика для кнопки и текста: сохраняем дальше или отменяем."""
+    if not yes:
+        context.user_data.pop("draft", None)
+        await respond(update, context, "Ок, не сохраняю.")
+        return ConversationHandler.END
+    text = context.user_data["draft"]["text"]
+    await respond(update, context, f"📝 «{text}»\nКакой приоритет?", PRIORITY_KEYBOARD)
+    return PRIORITY
+
+
+async def priority_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Шаг 2: приоритет выбран кнопкой."""
+    query = update.callback_query
+    await query.answer()
+    return await set_priority(update, context, query.data.split(":", 1)[1])
+
+
+async def priority_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Шаг 2: приоритет написан текстом (с опечатками: «срдений» -> средний)."""
+    priority = match_phrase(update.message.text, PRIORITY_WORDS)
+    if priority is not None:
+        return await set_priority(update, context, priority)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(PRIORITY_HINT)
+    return PRIORITY
+
+
+async def set_priority(update: Update, context: ContextTypes.DEFAULT_TYPE, priority: str) -> int:
+    if editing(context):
+        return await finish_edit(update, context, {"priority": priority})
+    context.user_data["draft"]["priority"] = priority
+    p = PRIORITIES[priority]
+    await respond(update, context, f"{p['emoji']} Приоритет: {p['name']}. Какой срок?", DUE_KEYBOARD)
+    return DUE
+
+
+async def due_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Шаг 3: срок выбран кнопкой."""
+    query = update.callback_query
+    await query.answer()
+    return await set_due(update, context, query.data.split(":", 1)[1])
+
+
+async def due_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Шаг 3: срок написан текстом — словом («завтра»), датой («14.10»)
+    или в рабочих днях («через 5 рабочих дней»)."""
+    # «сегодня» здесь — это срок, а не команда /today: ответ на вопрос проверяется первым
+    choice = match_phrase(update.message.text, DUE_WORDS)
+    if choice is not None:
+        return await set_due(update, context, choice)
+    due = parse_date(normalize(update.message.text))
+    if due is not None:
+        return await ask_category(update, context, due)
+    count = parse_workdays(update.message.text, word_required=True)
+    if count is not None:
+        return await set_due_in_workdays(update, context, count)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(DUE_HINT)
+    return DUE
+
+
+async def set_due(update: Update, context: ContextTypes.DEFAULT_TYPE, choice: str) -> int:
+    if choice == "custom":
+        await respond(update, context, "📅 Введите дату: ДД.ММ или ДД.ММ.ГГГГ, например 14.10")
+        return DATE_INPUT
+    if choice == "workdays":
+        await respond(update, context, f"📅 Через сколько рабочих дней? {WORKDAYS_HINT}")
+        return WORKDAYS_INPUT
+    due = {"today": today(), "tomorrow": today() + timedelta(days=1), "none": None}[choice]
+    return await ask_category(update, context, due)
+
+
+async def date_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Шаг 3 (вариант): после «Указать дату» ввели дату текстом."""
+    due = parse_date(normalize(update.message.text))
+    if due is None:
+        state = await try_text_command(update, context)
+        if state is not None:
+            return state
+        await update.message.reply_text("Не понял дату. Пример: 14.10 или 14.10.2026")
+        return DATE_INPUT
+    return await ask_category(update, context, due)
+
+
+# --- Срок в рабочих днях -------------------------------------------------------------
+
+MAX_WORKDAYS = 250  # примерно год рабочих дней
+WORKDAYS_HINT = f"Напишите число от 1 до {MAX_WORKDAYS}, например 5."
+# «через 5 рабочих дней», «5 рабочих дней», «5 раб. дней»; на шаге ввода числа — просто «5»
+WORKDAYS_WORDS_RE = r"(?: (?:рабочих|рабочий|рабочего|раб)\.?(?: (?:дней|дня|день|дн)\.?)?)"
+
+
+def parse_workdays(text: str, word_required: bool) -> int | None:
+    """Число рабочих дней из ответа. word_required — нужно ли слово «рабочих» (на шаге срока
+    просто «5» могло бы означать что угодно, а на шаге «Через сколько рабочих дней?» — нет)."""
+    words = WORKDAYS_WORDS_RE if word_required else WORKDAYS_WORDS_RE + "?"
+    m = re.fullmatch(rf"(?:через )?(\d{{1,3}}){words}", normalize(text))
+    return int(m[1]) if m else None
+
+
+async def workdays_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """После «Через N рабочих дней» написали число."""
+    count = parse_workdays(update.message.text, word_required=False)
+    if count is None:
+        state = await try_text_command(update, context)
+        if state is not None:
+            return state
+        await update.message.reply_text(f"Не понял число. {WORKDAYS_HINT}")
+        return WORKDAYS_INPUT
+    return await set_due_in_workdays(update, context, count)
+
+
+async def set_due_in_workdays(update: Update, context: ContextTypes.DEFAULT_TYPE, count: int) -> int:
+    """Срок через count рабочих дней: считаем по производственному календарю."""
+    if not 1 <= count <= MAX_WORKDAYS:
+        await update.message.reply_text(f"Так не получится. {WORKDAYS_HINT}")
+        return WORKDAYS_INPUT
+    due, from_calendar = await add_workdays(today(), count)
+    intro = (f"📅 Через {count} {plural(count, 'рабочий день', 'рабочих дня', 'рабочих дней')} — "
+             f"{fmt_day(due)}")
+    if not from_calendar:
+        intro += f"\n{CALENDAR_FALLBACK_NOTE}"
+    # Дата и так рабочая, поэтому предупреждение о выходном не нужно
+    return await ask_category(update, context, due, intro, check_day_off=False)
+
+
+# --- Шаг 4: категория -----------------------------------------------------------------
+
+NO_CATEGORY = ""  # «без категории» в ответах (None у match_phrase означает «не распознано»)
+NO_CATEGORY_WORDS = {"без категории": NO_CATEGORY, "без": NO_CATEGORY, "нет": NO_CATEGORY,
+                     "пропустить": NO_CATEGORY}
+CATEGORY_BUTTON_LIMIT = 20  # сколько категорий показывать кнопками
+CATEGORY_HINT = "Нажмите кнопку или напишите название категории."
+
+
+def user_categories(user_id: int) -> list[str]:
+    """Базовые категории и свои категории пользователя — в порядке создания."""
+    return BASE_CATEGORIES + db.custom_categories(user_id)
+
+
+def find_category(text: str, categories: list[str]) -> str | None:
+    """Существующая категория, совпадающая с text без учёта регистра (и с небольшими опечатками)."""
+    return match_phrase(text, {normalize(name): name for name in categories})
+
+
+def validate_category(name: str) -> str | None:
+    """Сообщение об ошибке или None, если название категории подходит."""
+    if not any(ch.isalpha() for ch in name):
+        return "В названии категории должна быть хотя бы одна буква."
+    if len(name) > MAX_CATEGORY_LENGTH:
+        return f"Слишком длинное название (больше {MAX_CATEGORY_LENGTH} символов)."
+    return None
+
+
+def clean_category_name(text: str) -> tuple[str, str | None]:
+    """Название категории из ответа: без лишних пробелов и знаков в конце, с заглавной буквы
+    («спорт» -> «Спорт», как у базовых категорий). Возвращает (название, ошибка или None)."""
+    name = " ".join(text.split()).rstrip(".,!?;:…")
+    error = validate_category(name)
+    if error:
+        return name, error
+    return name[0].upper() + name[1:], None
+
+
+def button_rows(buttons: list[InlineKeyboardButton], long_label: int = 14) -> list[list]:
+    """Кнопки по две в ряд; длинные подписи — на всю строку, чтобы Telegram их не обрезал."""
+    rows, pair = [], []
+    for button in buttons:
+        if len(button.text) > long_label:
+            rows.append([button])
+            continue
+        pair.append(button)
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    return rows
+
+
+def category_keyboard(categories: list[str]) -> InlineKeyboardMarkup:
+    """Категории кнопками (номер в callback: название может не влезть в 64 байта)
+    и «Без категории» отдельной строкой внизу."""
+    buttons = [InlineKeyboardButton(name, callback_data=f"cat:{i}")
+               for i, name in enumerate(categories[:CATEGORY_BUTTON_LIMIT])]
+    rows = button_rows(buttons)
+    rows.append([InlineKeyboardButton("Без категории", callback_data="cat:none")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def ask_category(update: Update, context: ContextTypes.DEFAULT_TYPE, due: date | None,
+                       intro: str | None = None, check_day_off: bool = True) -> int:
+    """Срок выбран: запоминаем его, предупреждаем о выходном или празднике
+    и спрашиваем категорию. При редактировании — сразу сохраняем новый срок."""
+    if editing(context):
+        notes = (intro or "") + (await day_off_warning(due) if check_day_off else "")
+        return await finish_edit(update, context, {"due": due.isoformat() if due else None},
+                                 [line for line in notes.split("\n") if line])
+    context.user_data["draft"]["due"] = due.isoformat() if due else None
+    if intro is None:
+        intro = f"📅 Срок: {fmt_day(due)}" if due else "📅 Без срока."
+    if check_day_off:
+        intro += await day_off_warning(due)
+    categories = user_categories(update.effective_user.id)
+    await respond(update, context,
+                  f"{intro}\n\n🏷 Категория задачи? Выберите из списка или напишите свою.",
+                  category_keyboard(categories))
+    return CATEGORY
+
+
+async def category_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Категория выбрана кнопкой."""
+    query = update.callback_query
+    await query.answer()
+    value = query.data.split(":", 1)[1]
+    if value == "none":
+        return await finish_add(update, context, None)
+    categories = user_categories(update.effective_user.id)
+    index = int(value)
+    if index >= len(categories):  # кнопка от старого списка
+        await respond(update, context, f"Выберите категорию ещё раз. {CATEGORY_HINT}",
+                      category_keyboard(categories))
+        return CATEGORY
+    return await finish_add(update, context, categories[index])
+
+
+async def category_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Категория написана текстом: существующая, «без категории» или новая.
+    Порядок: сначала ответ на вопрос (существующая категория), затем текстовая команда,
+    и только потом — новая категория (иначе «отмена» стала бы категорией)."""
+    text = update.message.text
+    if match_phrase(text, NO_CATEGORY_WORDS) is not None:
+        return await finish_add(update, context, None)
+    user_id = update.effective_user.id
+    existing = find_category(text, user_categories(user_id))
+    if existing:
+        return await finish_add(update, context, existing)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+
+    name, error = clean_category_name(text)
+    if error:
+        await update.message.reply_text(f"{error} {CATEGORY_HINT}")
+        return CATEGORY
+    db.add_category(user_id, name)
+    return await finish_add(update, context, name, new_category=True)
+
+
+def save_draft(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, dict]:
+    """Сохраняет черновик как задачу. Возвращает текст подтверждения и саму задачу."""
+    draft = context.user_data.pop("draft", {})
+    user_id = get_user(context, update.effective_user.id)["user_id"]
+    task = db.add_task(user_id, text=draft["text"], priority=draft["priority"],
+                       due=draft.get("due"), category=draft.get("category"))
+
+    p = PRIORITIES[task["priority"]]
+    due = task_due(task)
+    result = f"Задача #{task['id']} добавлена: {p['emoji']} {p['name']}, "
+    result += f"срок {fmt_date(due)}" if due else "без срока"
+    if task["category"]:
+        result += f", 🏷 {task['category']}"
+    if due and due < today():
+        result += "\n⚠️ Эта дата уже прошла — задача сразу просрочена."
+    return result, task
+
+
+async def finish_add(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                     category: str | None, new_category: bool = False) -> int:
+    """Последний шаг добавления: сохраняем задачу и сразу спрашиваем, напомнить ли о ней.
+    При редактировании — сохраняем новую категорию задачи."""
+    if editing(context):
+        notes = [f"🏷 Новая категория «{category}» сохранена."] if new_category else []
+        return await finish_edit(update, context, {"category": category}, notes)
+    context.user_data["draft"]["category"] = category
+    confirmation, task = save_draft(update, context)
+    if new_category:
+        confirmation = f"🏷 Новая категория «{category}» сохранена.\n{confirmation}"
+    context.user_data["remind_after_add"] = True
+    context.user_data["remind_prefix"] = f"{confirmation}\n\n"  # чтобы не потерять подтверждение
+    return await ask_remind_option(update, context, task, f"{confirmation}\n\nНапомнить о задаче?")
+
+
+# --- Редактирование задачи (/edit) ---------------------------------------------------
+# Те же шаги, что при добавлении (текст, приоритет, срок, категория). Пока в user_data
+# лежит «edit» с номером задачи, последний шаг не создаёт задачу, а вызывает finish_edit.
+
+EDIT_FIELD_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Текст", callback_data="efield:text"),
+     InlineKeyboardButton("Приоритет", callback_data="efield:priority")],
+    [InlineKeyboardButton("Срок", callback_data="efield:due"),
+     InlineKeyboardButton("Категория", callback_data="efield:category")],
+])
+EDIT_FIELD_WORDS = {"текст": "text", "приоритет": "priority", "срок": "due", "дата": "due",
+                    "категория": "category", "категорию": "category"}
+EDIT_FIELD_HINT = "Напишите: текст, приоритет, срок или категория, либо нажмите кнопку."
+EDIT_DUPLICATE_KEYBOARD = InlineKeyboardMarkup([[
+    InlineKeyboardButton("Сохранить", callback_data="dup:yes"),
+    InlineKeyboardButton("Отмена", callback_data="dup:no"),
+]])
+
+# Напоминания, привязанные к сроку: при смене срока они переносятся на новую дату
+DUE_REMINDER_NOTES = {"в день срока": "due", "за сутки до срока": "day",
+                      "за неделю до срока": "week", "за месяц до срока": "month"}
+
+
+def editing(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Идёт ли сейчас редактирование задачи (а не добавление новой)."""
+    return "edit" in context.user_data
+
+
+async def edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/edit <номер> — изменить задачу. Без номера — выбор задачи кнопками."""
+    await end_dialog_quietly(context)
+    args = context.args or []
+    if not args:
+        return await ask_pick_task(update, context, "edit")
+    task_id = parse_task_id(args[0]) if len(args) == 1 else None
+    if task_id is None:
+        await update.message.reply_text("Укажите номер задачи. Пример: /edit 3")
+        return ConversationHandler.END
+    return await ask_edit_field(update, context, task_id)
+
+
+async def ask_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int) -> int:
+    """Показывает задачу и спрашивает, что в ней изменить."""
+    task = find_task(get_user(context, update.effective_user.id), task_id)
+    if not task:
+        await respond(update, context, f"Задачи #{task_id} нет. Посмотреть номера: /list")
+        return ConversationHandler.END
+    if task["status"] == "done":
+        await respond(update, context,
+                      f"Задача #{task_id} уже выполнена — изменить можно только активную задачу.")
+        return ConversationHandler.END
+    context.user_data["edit"] = task_id
+    context.user_data["draft"] = {}  # шаги добавления складывают ответы в черновик
+    await respond(update, context, f"✏️ {task_line(task)}\nЧто изменить?", EDIT_FIELD_KEYBOARD)
+    return EDIT_FIELD
+
+
+def edited_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    """Задача, которую сейчас редактируем (None, если её успели удалить или выполнить)."""
+    task_id = context.user_data.get("edit")
+    task = find_task(get_user(context, update.effective_user.id), task_id) if task_id else None
+    return task if task and task["status"] == "active" else None
+
+
+async def edit_field_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Кнопки «Текст», «Приоритет», «Срок», «Категория»."""
+    query = update.callback_query
+    await query.answer()
+    return await ask_edit_value(update, context, query.data.split(":", 1)[1])
+
+
+async def edit_field_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ответ текстом на «Что изменить?»: «срок», «категорию»…"""
+    field = match_phrase(update.message.text, EDIT_FIELD_WORDS)
+    if field:
+        return await ask_edit_value(update, context, field)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(EDIT_FIELD_HINT)
+    return EDIT_FIELD
+
+
+async def ask_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str) -> int:
+    """Тот же вопрос, что при добавлении задачи, и текущее значение."""
+    task = edited_task(update, context)
+    if not task:
+        return await finish_edit(update, context, {})  # finish_edit объяснит, что задачи нет
+    if field == "text":
+        await respond(update, context, f"📝 Сейчас: «{task['text']}»\nНапишите новый текст задачи.")
+        return TEXT
+    if field == "priority":
+        p = PRIORITIES[task["priority"]]
+        await respond(update, context, f"Сейчас: {p['emoji']} {p['name']}. Какой приоритет?",
+                      PRIORITY_KEYBOARD)
+        return PRIORITY
+    if field == "due":
+        due = task_due(task)
+        current = f"до {fmt_day(due)}" if due else "без срока"
+        await respond(update, context, f"📅 Сейчас: {current}. Какой срок?", DUE_KEYBOARD)
+        return DUE
+    current = f"🏷 {task['category']}" if task.get("category") else "без категории"
+    await respond(update, context,
+                  f"Сейчас: {current}.\n🏷 Категория задачи? Выберите из списка или напишите свою.",
+                  category_keyboard(user_categories(update.effective_user.id)))
+    return CATEGORY
+
+
+async def edit_text_entered(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    """Новый текст задачи. Как при добавлении, переспрашиваем, если такая задача уже есть."""
+    user = get_user(context, update.effective_user.id)
+    duplicate = find_duplicate(user, text, exclude_id=context.user_data["edit"])
+    if duplicate:
+        context.user_data["draft"]["text"] = text
+        line = task_line(duplicate)
+        dot = "" if line.endswith((".", "!", "?", "…")) else "."
+        await respond(update, context, f"Такая задача уже есть: {line}{dot} Всё равно сохранить?",
+                      EDIT_DUPLICATE_KEYBOARD)
+        return DUPLICATE
+    return await finish_edit(update, context, {"text": text})
+
+
+def move_due_reminder(task: dict) -> str:
+    """Срок изменился: напоминание «за сутки до срока» и т. п. переносим на новую дату.
+    Возвращает строку для ответа пользователю ('' — если напоминание не привязано к сроку)."""
+    note = task.get("remind_note")
+    if not task.get("remind_at") or note not in DUE_REMINDER_NOTES:
+        return ""
+    if task_due(task) is None:
+        task["remind_at"] = task["remind_note"] = None
+        return f"🔕 Напоминание «{note}» снято: у задачи больше нет срока."
+    _, when, _ = remind_options(task)[DUE_REMINDER_NOTES[note]]
+    if when <= now():
+        task["remind_at"] = task["remind_note"] = None
+        return (f"🔕 Напоминание «{note}» снято: для нового срока это время уже прошло "
+                f"({fmt_when(when)}). Поставить другое: /remind {task['id']}")
+    task["remind_at"] = when.isoformat(timespec="seconds")
+    return f"⏰ Напоминание перенесено: {fmt_when(when)} ({note})."
+
+
+async def finish_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, changes: dict,
+                      notes: list[str] | None = None) -> int:
+    """Сохраняет изменения задачи и показывает её обновлённой."""
+    task = edited_task(update, context)
+    task_id = context.user_data.get("edit")
+    for key in ("edit", "draft"):
+        context.user_data.pop(key, None)
+    if not task:
+        await respond(update, context, f"Задача #{task_id} уже удалена или выполнена — изменить её нельзя.")
+        return ConversationHandler.END
+
+    old_due = task["due"]
+    task.update(changes)
+    lines = [f"✏️ Задача #{task['id']} изменена: {task_line(task, show_id=False)}"]
+    lines += notes or []
+    if "due" in changes:
+        due = task_due(task)
+        if due and due < today():
+            lines.append("⚠️ Эта дата уже прошла — задача просрочена.")
+        if task["due"] != old_due:
+            reminder_note = move_due_reminder(task)
+            if reminder_note:
+                lines.append(reminder_note)
+
+    user_id = update.effective_user.id
+    db.save_task(user_id, task)
+    schedule_reminder(context.job_queue, user_id, task)  # переставит или снимет напоминание
+    await respond(update, context, "\n".join(lines))
+    return ConversationHandler.END
+
+
+# --- Удаление с подтверждением ----------------------------------------------
+
+async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/delete <номер> — спрашиваем подтверждение. Без номера — выбор задачи кнопками."""
+    await end_dialog_quietly(context)  # если шёл другой диалог — завершаем его
+    args = context.args or []
+    if not args:
+        return await ask_pick_task(update, context, "delete")
+    task_id = parse_task_id(args[0]) if len(args) == 1 else None
+    if task_id is None:
+        await update.message.reply_text("Укажите номер задачи. Пример: /delete 3")
+        return ConversationHandler.END
+    return await ask_delete(update, context, task_id)
+
+
+async def ask_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int) -> int:
+    """Спрашивает «Удалить задачу?» (кнопкой или текстом «да» / «нет»)."""
+    task = find_task(get_user(context, update.effective_user.id), task_id)
+    if not task:
+        await respond(update, context, f"Задачи #{task_id} нет. Посмотреть номера: /list")
+        return ConversationHandler.END
+    context.user_data["delete_id"] = task_id
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Да", callback_data=f"del:yes:{task_id}"),
+        InlineKeyboardButton("Нет", callback_data=f"del:no:{task_id}"),
+    ]])
+    await respond(update, context, f"Удалить задачу?\n{task_line(task)}", keyboard)
+    return DELETE_CONFIRM
+
+
+async def delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Кнопки «Да» / «Нет» под /delete. Работают и после окончания диалога."""
+    query = update.callback_query
+    await query.answer()
+    _, answer, raw_id = query.data.split(":")
+    return await delete_answer(update, context, int(raw_id), answer == "yes")
+
+
+async def delete_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ответ текстом на «Удалить задачу?». Сначала — ответ, затем — текстовая команда."""
+    yes = match_phrase(update.message.text, DELETE_WORDS)
+    if yes is not None:
+        return await delete_answer(update, context, context.user_data.get("delete_id"), yes)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(YES_NO_HINT)
+    return DELETE_CONFIRM
+
+
+async def delete_answer(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        task_id: int | None, yes: bool) -> int:
+    """Общая логика для кнопки и текста: удаляем или оставляем."""
+    context.user_data.pop("delete_id", None)
+    if not yes:
+        await respond(update, context, "Ок, задача остаётся.")
+        return ConversationHandler.END
+    user_id = update.effective_user.id
+    user = get_user(context, user_id)
+    task = find_task(user, task_id) if task_id is not None else None
+    if not task:
+        await respond(update, context, f"Задача #{task_id} уже удалена.")
+        return ConversationHandler.END
+    db.delete_task(user_id, task_id)
+    cancel_jobs(context.job_queue, reminder_job_name(user_id, task_id))
+    await respond(update, context, f"🗑 Задача #{task_id} удалена.")
+    return ConversationHandler.END
+
+
+# --- Выход из диалога ---------------------------------------------------------
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/cancel — прервать диалог."""
+    had_dialog = any(key in context.user_data for key in DIALOG_KEYS)
+    await end_dialog_quietly(context)
+    await update.message.reply_text("Отменено." if had_dialog else "Нечего отменять 🙂")
+    return ConversationHandler.END
+
+
+async def end_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Любая другая команда посреди диалога: молча завершаем диалог.
+    Саму команду затем выполнит обычный обработчик из группы 1 (см. build_application)."""
+    await end_dialog_quietly(context)
+    return ConversationHandler.END
+
+
+async def dialog_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """10 минут без ответа — тихо завершаем диалог."""
+    await end_dialog_quietly(context)
+
+
+# ---------------------------------------------------------------------------
+# Команды: списки и выполнение
+# ---------------------------------------------------------------------------
+
+# --- /list и фильтры ---------------------------------------------------------------
+# Фильтр — пара (вид, значение): ("prio", "high"), ("cat", "Рабочие"), ("cat", "") — без
+# категории, ("week", "") — ближайшая неделя. None — без фильтра, все активные задачи.
+
+LIST_FILTER_EXAMPLE = "Например: /list высокий, /list рабочие, /list неделя."
+
+
+def list_filter_options(user_id: int) -> dict:
+    """Текстовые варианты фильтров: «высокий», «неделя», названия категорий…"""
+    options = {
+        "высокий": ("prio", "high"), "высокие": ("prio", "high"),
+        "средний": ("prio", "medium"), "средние": ("prio", "medium"),
+        "низкий": ("prio", "low"), "низкие": ("prio", "low"),
+        "неделя": ("week", ""), "неделю": ("week", ""), "на неделю": ("week", ""),
+        "на неделе": ("week", ""), "ближайшая неделя": ("week", ""),
+        "без категории": ("cat", ""),
+    }
+    for name in user_categories(user_id):
+        options.setdefault(normalize(name), ("cat", name))
+    return options
+
+
+def filter_tasks(user: dict, spec: tuple[str, str] | None) -> tuple[str, list[dict]]:
+    """Заголовок и активные задачи, подходящие под фильтр (в порядке /list)."""
+    tasks = active_tasks(user)
+    if spec is None:
+        return f"📋 Активные задачи ({len(tasks)}):", tasks
+    kind, value = spec
+    if kind == "prio":
+        selected = [t for t in tasks if t["priority"] == value]
+        p = PRIORITIES[value]
+        return f"{p['emoji']} Приоритет «{p['name']}» ({len(selected)}):", selected
+    if kind == "cat":
+        selected = [t for t in tasks if normalize(t.get("category") or "") == normalize(value)]
+        title = f"🏷 {value}" if value else "🏷 Без категории"
+        return f"{title} ({len(selected)}):", selected
+    # Ближайшая неделя: срок не позже чем через 6 дней (просроченные тоже сюда попадают)
+    last = today() + timedelta(days=6)
+    selected = [t for t in tasks if task_due(t) and task_due(t) <= last]
+    return f"📅 Ближайшая неделя, срок до {fmt_day(last)} ({len(selected)}):", selected
+
+
+def render_list(user: dict, spec: tuple[str, str] | None) -> str:
+    title, tasks = filter_tasks(user, spec)
+    if not tasks:
+        return f"{title}\nЗадач нет."
+    return join_lines(f"{title}\n", [task_line(t) for t in tasks])
+
+
+def list_keyboard(filtered: bool) -> InlineKeyboardMarkup:
+    """Кнопки фильтров под списком задач."""
+    rows = [
+        [InlineKeyboardButton(p["button"], callback_data=f"flt:p:{key}")
+         for key, p in PRIORITIES.items()],
+        [InlineKeyboardButton("📅 Неделя", callback_data="flt:week"),
+         InlineKeyboardButton("🏷 Категории", callback_data="flt:cats")],
+    ]
+    if filtered:
+        rows.append([InlineKeyboardButton("📋 Все задачи", callback_data="flt:all")])
+    return InlineKeyboardMarkup(rows)
+
+
+def category_filter_keyboard(user: dict) -> InlineKeyboardMarkup:
+    """Категории, в которых есть активные задачи, с количеством задач."""
+    counts = Counter(normalize(t.get("category") or "") for t in active_tasks(user))
+    buttons = [InlineKeyboardButton(f"{name} ({counts[normalize(name)]})", callback_data=f"flt:c:{i}")
+               for i, name in enumerate(user_categories(user["user_id"])) if counts[normalize(name)]]
+    rows = button_rows(buttons)
+    if counts[""]:
+        rows.append([InlineKeyboardButton(f"Без категории ({counts['']})", callback_data="flt:c:none")])
+    rows.append([InlineKeyboardButton("⬅️ Все задачи", callback_data="flt:all")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/list — активные задачи с кнопками фильтров. Фильтр можно написать сразу:
+    /list высокий, /list рабочие, /list неделя (или текстом: «список рабочие»)."""
+    user = get_user(context, update.effective_user.id)
+    if not active_tasks(user):
+        await update.message.reply_text("Активных задач нет 🎉 Добавить: /add")
+        return
+    spec = None
+    if context.args:
+        wanted = " ".join(context.args)
+        spec = match_phrase(wanted, list_filter_options(user["user_id"]))
+        if spec is None:
+            categories = ", ".join(user_categories(user["user_id"]))
+            await update.message.reply_text(
+                f"Не понял фильтр «{wanted}». {LIST_FILTER_EXAMPLE}\nКатегории: {categories}.")
+            return
+    await update.message.reply_text(render_list(user, spec), reply_markup=list_keyboard(spec is not None))
+
+
+async def list_filter_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки фильтров под /list: flt:p:high, flt:week, flt:cats, flt:c:3, flt:c:none, flt:all."""
+    query = update.callback_query
+    await query.answer()
+    user = get_user(context, update.effective_user.id)
+    parts = query.data.split(":")
+    if parts[1] == "cats":  # показать кнопки категорий вместо кнопок фильтров
+        await query.edit_message_reply_markup(category_filter_keyboard(user))
+        return
+    spec = None
+    if parts[1] == "p" and parts[2] in PRIORITIES:
+        spec = ("prio", parts[2])
+    elif parts[1] == "week":
+        spec = ("week", "")
+    elif parts[1] == "c":
+        categories = user_categories(user["user_id"])
+        if parts[2] == "none":
+            spec = ("cat", "")
+        elif int(parts[2]) < len(categories):
+            spec = ("cat", categories[int(parts[2])])
+    await query.edit_message_text(render_list(user, spec), reply_markup=list_keyboard(spec is not None))
+
+
+async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/today — задачи на сегодня и просроченные."""
+    tasks = today_tasks(get_user(context, update.effective_user.id))
+    if not tasks:
+        await update.message.reply_text("На сегодня задач нет 🎉")
+        return
+    await update.message.reply_text(join_lines("📅 На сегодня:\n", [task_line(t) for t in tasks]))
+
+
+def complete_task(context: ContextTypes.DEFAULT_TYPE, user_id: int, task: dict) -> None:
+    """Отмечает задачу выполненной и снимает её напоминание."""
+    task["status"] = "done"
+    task["done_at"] = now().isoformat(timespec="seconds")
+    task["remind_at"] = None
+    task["remind_note"] = None
+    cancel_jobs(context.job_queue, reminder_job_name(user_id, task["id"]))
+    db.save_task(user_id, task)
+
+
+def complete_by_id(context: ContextTypes.DEFAULT_TYPE, user_id: int, task_id: int) -> str:
+    """Отмечает задачу выполненной по номеру и возвращает текст ответа."""
+    task = find_task(get_user(context, user_id), task_id)
+    if not task:
+        return f"Задачи #{task_id} нет. Посмотреть номера: /list"
+    if task["status"] == "done":
+        return f"Задача #{task_id} уже выполнена 👍"
+    complete_task(context, user_id, task)
+    return f"✅ Задача #{task_id} выполнена: {task['text']}"
+
+
+async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/done <номер>. Без номера — выбор задачи кнопками."""
+    await end_dialog_quietly(context)
+    args = context.args or []
+    if not args:
+        return await ask_pick_task(update, context, "done")
+    task_id = parse_task_id(args[0]) if len(args) == 1 else None
+    if task_id is None:
+        await update.message.reply_text("Укажите номер задачи. Пример: /done 3")
+        return ConversationHandler.END
+    await update.message.reply_text(complete_by_id(context, update.effective_user.id, task_id))
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Напоминания
+# ---------------------------------------------------------------------------
+
+REMIND_EXAMPLE = "Пример: /remind 3 18:30 или /remind 3 14.10 18:30"
+CUSTOM_TIME_EXAMPLE = "Пример: 18:30 или 14.10 18:30"
+REMIND_HOUR = time(10, 0)  # во сколько приходят напоминания «в день срока», «за сутки» и т. п.
+PICK_LIMIT = 10            # сколько задач показывать кнопками
+BUTTON_TEXT_LIMIT = 30     # сколько символов текста задачи помещается на кнопку
+
+
+def parse_remind_moment(parts: list[str], example: str) -> tuple[datetime | None, str | None]:
+    """«18:30» или «14.10 18:30» -> момент напоминания.
+
+    Если указано только время и оно уже прошло — напоминаем завтра.
+    Возвращает (момент, None) или (None, текст ошибки).
+    """
+    if len(parts) not in (1, 2):
+        return None, f"Не понял время. {example}"
+    remind_time = parse_time(parts[-1])
+    if remind_time is None:
+        return None, f"Не понял время. {example}"
+    if len(parts) == 2:
+        remind_date = parse_date(parts[0])
+        if remind_date is None:
+            return None, f"Не понял дату. {example}"
+        when = datetime.combine(remind_date, remind_time, tzinfo=TZ)
+        if when <= now():
+            return None, "Это время уже прошло. Укажите момент в будущем."
+        return when, None
+    when = datetime.combine(today(), remind_time, tzinfo=TZ)
+    if when <= now():
+        when += timedelta(days=1)
+    return when, None
+
+
+def looks_like_time(parts: list[str]) -> bool:
+    """Похоже ли сообщение на время («18:30», «14.10 18:30»), даже если в нём ошибка («25:00»)."""
+    return bool(parts) and len(parts) <= 2 and re.fullmatch(TIME_RE, parts[-1]) is not None
+
+
+def set_reminder(context: ContextTypes.DEFAULT_TYPE, user_id: int, task: dict,
+                 when: datetime, note: str | None = None) -> str:
+    """Ставит напоминание (старое заменяется: у задачи оно одно) и возвращает подтверждение."""
+    task["remind_at"] = when.isoformat(timespec="seconds")
+    task["remind_note"] = note
+    db.save_task(user_id, task)
+    schedule_reminder(context.job_queue, user_id, task)
+    text = f"⏰ Напомню о задаче #{task['id']} {fmt_when(when)}"
+    return f"{text} ({note})" if note else text
+
+
+def clear_reminder(context: ContextTypes.DEFAULT_TYPE, user_id: int, task: dict) -> bool:
+    """Снимает напоминание с задачи. Возвращает True, если оно было."""
+    had_reminder = bool(task.get("remind_at"))
+    task["remind_at"] = None
+    task["remind_note"] = None
+    cancel_jobs(context.job_queue, reminder_job_name(user_id, task["id"]))
+    db.save_task(user_id, task)
+    return had_reminder
+
+
+def month_before(d: date) -> date:
+    """То же число предыдущего месяца, а если такого числа нет — последний день месяца.
+    Например, 15.11 -> 15.10, 31.03 -> 28.02 (или 29.02 в високосный год)."""
+    year, month = (d.year, d.month - 1) if d.month > 1 else (d.year - 1, 12)
+    return date(year, month, min(d.day, calendar.monthrange(year, month)[1]))
+
+
+# Варианты, привязанные к сроку задачи
+DUE_OPTION_KEYS = ("due", "day", "week", "month")
+
+
+def remind_options(task: dict) -> dict[str, tuple[str, datetime | None, str | None]]:
+    """Варианты напоминания для задачи: ключ -> (текст кнопки, момент, пояснение).
+
+    Всегда: через час, завтра в 10:00, через неделю.
+    Если у задачи есть срок, ещё: в день срока, за сутки, за неделю, за месяц до срока
+    (в 10:00 выбранного дня). И в конце — «Указать время» и «Не напоминать».
+    Варианты показываем все, даже если время какого-то уже прошло:
+    при его выборе бот объяснит это и попросит выбрать другой.
+    """
+    current = now()
+    tomorrow = datetime.combine(today() + timedelta(days=1), REMIND_HOUR, tzinfo=TZ)
+    options = {
+        "hour": ("Через час", current + timedelta(hours=1), "через час"),
+        "tomorrow": ("Завтра в 10:00", tomorrow, None),  # день и время и так видны
+        "week_later": ("Через неделю", current + timedelta(days=7), "через неделю"),
+    }
+    due = task_due(task)
+    if due:
+        # На кнопках короткие подписи: ширину кнопок Telegram задать не даёт, и при двух
+        # колонках «За сутки до срока» обрезалось бы. Полное название — в пояснении:
+        # оно видно в подтверждении, в /reminders и в предупреждении о прошедшем времени.
+        by_due = [
+            ("due", "В день срока", due, "в день срока"),
+            ("day", "За сутки", due - timedelta(days=1), "за сутки до срока"),
+            ("week", "За неделю", due - timedelta(days=7), "за неделю до срока"),
+            ("month", "За месяц", month_before(due), "за месяц до срока"),
+        ]
+        for key, label, day, note in by_due:
+            options[key] = (label, datetime.combine(day, REMIND_HOUR, tzinfo=TZ), note)
+    options["custom"] = ("Указать время", None, None)
+    options["none"] = ("Не напоминать", None, None)
+    return options
+
+
+def remind_keyboard(options: dict) -> InlineKeyboardMarkup:
+    """Кнопки вариантов по две в ряд, «Не напоминать» — отдельной строкой внизу."""
+    buttons = [InlineKeyboardButton(label, callback_data=f"ropt:{key}")
+               for key, (label, _, _) in options.items() if key != "none"]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton(options["none"][0], callback_data="ropt:none")])
+    return InlineKeyboardMarkup(rows)
+
+
+def remind_option_words(options: dict) -> dict[str, str]:
+    """Текстовые ответы: названия кнопок («за сутки до срока» -> "day") и короткие формы.
+    Варианты срока распознаём всегда — чтобы объяснить, если у задачи срока нет."""
+    words = {normalize(label): key for key, (label, _, _) in options.items()}
+    words.update({
+        "завтра": "tomorrow",
+        "в день срока": "due",
+        "за сутки": "day",
+        "за неделю": "week",
+        "за месяц": "month",
+        "за сутки до срока": "day",
+        "за неделю до срока": "week",
+        "за месяц до срока": "month",
+        "нет": "none",
+        "не надо": "none",
+    })
+    return words
+
+
+def due_options_note(task: dict) -> str:
+    """Строка под вопросом: кнопки «За сутки», «За неделю», «За месяц» считаются от срока."""
+    return "\nВарианты «за …» — до срока" if task_due(task) else ""
+
+
+def remind_option_hint(options: dict) -> str:
+    first_label = next(iter(options.values()))[0].lower()
+    return (f"Выберите вариант кнопкой или напишите его, например «{first_label}», "
+            f"либо время: 18:30 или 14.10 18:30.")
+
+
+# --- /remind ---------------------------------------------------------------------
+
+async def remind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/remind — выбрать задачу кнопками; /remind 3 — варианты напоминания;
+    /remind 3 18:30 или /remind 3 14.10 18:30 — сразу на указанное время."""
+    await end_dialog_quietly(context)
+    args = context.args or []
+    if not args:
+        return await ask_pick_task(update, context, "remind")
+    if len(args) > 3:
+        await update.message.reply_text(f"Укажите номер задачи и время. {REMIND_EXAMPLE}")
+        return ConversationHandler.END
+    task_id = parse_task_id(args[0])
+    if task_id is None:
+        await update.message.reply_text(f"Не понял номер задачи. {REMIND_EXAMPLE}")
+        return ConversationHandler.END
+    return await remind_task(update, context, task_id, args[1:])
+
+
+async def remind_task(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                      task_id: int, time_parts: list[str]) -> int:
+    """Напоминание для задачи: без времени — показываем варианты, со временем — ставим сразу."""
+    user_id = update.effective_user.id
+    task = find_task(get_user(context, user_id), task_id)
+    if not task:
+        await respond(update, context, f"Задачи #{task_id} нет. Посмотреть номера: /list")
+        return ConversationHandler.END
+    if task["status"] == "done":
+        await respond(update, context, f"Задача #{task_id} уже выполнена — напоминать не о чем 👍")
+        return ConversationHandler.END
+    if not time_parts:
+        return await ask_remind_option(update, context, task, f"Когда напомнить?\n{task_line(task)}")
+    when, error = parse_remind_moment(time_parts, REMIND_EXAMPLE)
+    if error:
+        await respond(update, context, error)
+        return ConversationHandler.END
+    await respond(update, context, set_reminder(context, user_id, task, when))
+    return ConversationHandler.END
+
+
+# --- Выбор задачи кнопками (/done, /delete, /remind, /edit без номера) ---------------
+
+PICK_PROMPTS = {
+    "done": "Какую задачу отметить выполненной?\nНажмите кнопку или напишите номер.",
+    "delete": "Какую задачу удалить?\nНажмите кнопку или напишите номер.",
+    "edit": "Какую задачу изменить?\nНажмите кнопку или напишите номер.",
+    "remind": ("Для какой задачи поставить напоминание?\n"
+               "Нажмите кнопку или напишите номер — можно сразу со временем: 1 11:43"),
+}
+PICK_HINTS = {
+    "done": "Нажмите кнопку с задачей или напишите её номер, например 3.",
+    "delete": "Нажмите кнопку с задачей или напишите её номер, например 3.",
+    "edit": "Нажмите кнопку с задачей или напишите её номер, например 3.",
+    "remind": "Нажмите кнопку с задачей или напишите номер, например 3 или 3 18:30.",
+}
+
+
+def button_label(task: dict) -> str:
+    """«#4 Подготовить отчёт по лаб…»: номер и начало текста — не больше 30 символов."""
+    text = task["text"]
+    if len(text) > BUTTON_TEXT_LIMIT:
+        text = text[:BUTTON_TEXT_LIMIT - 1].rstrip() + "…"
+    return f"#{task['id']} {text}"
+
+
+async def ask_pick_task(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> int:
+    """Показывает активные задачи кнопками (в порядке /list) для done / delete / remind / edit."""
+    tasks = active_tasks(get_user(context, update.effective_user.id))
+    if not tasks:
+        await update.message.reply_text("Активных задач нет 🎉 Добавить: /add")
+        return ConversationHandler.END
+    context.user_data["pick"] = action
+    prompt = PICK_PROMPTS[action]
+    if len(tasks) > PICK_LIMIT:
+        prompt += f"\nПоказаны первые {PICK_LIMIT} из {len(tasks)}, номер любой задачи можно написать."
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(button_label(t), callback_data=f"pick:{t['id']}")]
+        for t in tasks[:PICK_LIMIT]
+    ])
+    await respond(update, context, prompt, keyboard)
+    return PICK_TASK
+
+
+async def pick_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Нажата кнопка с задачей."""
+    query = update.callback_query
+    await query.answer()
+    return await pick_task(update, context, int(query.data.split(":")[1]), [])
+
+
+async def pick_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Номер задачи текстом. Для /remind можно сразу со временем: «1 11:43», «1 14.10 11:43»."""
+    action = context.user_data.get("pick")
+    parts = normalize(update.message.text).split()
+    task_id = parse_task_id(parts[0]) if parts else None
+    max_parts = 3 if action == "remind" else 1
+    if task_id is not None and len(parts) <= max_parts:
+        return await pick_task(update, context, task_id, parts[1:])
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(PICK_HINTS.get(action, PICK_HINTS["done"]))
+    return PICK_TASK
+
+
+async def pick_task(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                    task_id: int, rest: list[str]) -> int:
+    """Задача выбрана — продолжаем ту команду, ради которой её выбирали."""
+    action = context.user_data.pop("pick", None)
+    if action == "done":
+        await respond(update, context, complete_by_id(context, update.effective_user.id, task_id))
+        return ConversationHandler.END
+    if action == "delete":
+        return await ask_delete(update, context, task_id)
+    if action == "remind":
+        return await remind_task(update, context, task_id, rest)
+    if action == "edit":
+        return await ask_edit_field(update, context, task_id)
+    return ConversationHandler.END
+
+
+# --- Выбор варианта напоминания -----------------------------------------------------
+
+async def ask_remind_option(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            task: dict, question: str) -> int:
+    """Показывает варианты напоминания для задачи."""
+    context.user_data["remind_id"] = task["id"]
+    await respond(update, context, question + due_options_note(task),
+                  remind_keyboard(remind_options(task)))
+    return REMIND_OPTION
+
+
+def task_in_remind_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    """Задача, для которой сейчас выбираем напоминание (None, если её удалили или выполнили)."""
+    task_id = context.user_data.get("remind_id")
+    task = find_task(get_user(context, update.effective_user.id), task_id) if task_id else None
+    return task if task and task["status"] == "active" else None
+
+
+async def finish_remind_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE, result: str) -> int:
+    """Показывает итог и завершает диалог.
+    Если вопрос задан сразу после добавления задачи и ответили кнопкой, то сообщение
+    редактируется — поэтому сохраняем в нём подтверждение «Задача #N добавлена…»."""
+    prefix = context.user_data.get("remind_prefix", "") if update.callback_query else ""
+    for key in ("remind_id", "remind_after_add", "remind_prefix"):
+        context.user_data.pop(key, None)
+    await respond(update, context, prefix + result)
+    return ConversationHandler.END
+
+
+async def remind_option_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Нажата кнопка варианта напоминания."""
+    query = update.callback_query
+    await query.answer()
+    return await apply_remind_option(update, context, query.data.split(":", 1)[1])
+
+
+async def remind_option_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ответ текстом: вариант («за сутки», «звтра»), сразу время («18:30») или что-то другое."""
+    task = task_in_remind_dialog(update, context)
+    if not task:
+        return await finish_remind_dialog(update, context, "Задача уже удалена или выполнена.")
+    options = remind_options(task)
+    key = match_phrase(update.message.text, remind_option_words(options))
+    if key:
+        return await apply_remind_option(update, context, key)
+    parts = normalize(update.message.text).split()
+    if looks_like_time(parts):
+        return await apply_custom_time(update, context, parts)
+    if context.user_data.get("remind_after_add"):
+        if match_phrase(update.message.text, YES_NO_WORDS) is True:  # «да» — но когда именно?
+            await update.message.reply_text(remind_option_hint(options))
+            return REMIND_OPTION
+        return await close_question_after_add(update, context)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(remind_option_hint(options))
+    return REMIND_OPTION
+
+
+async def apply_remind_option(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> int:
+    """Общая логика для кнопки и текста: ставим, снимаем или просим указать время."""
+    task = task_in_remind_dialog(update, context)
+    if not task:
+        return await finish_remind_dialog(update, context, "Задача уже удалена или выполнена.")
+    options = remind_options(task)
+    if key not in options:
+        if key in DUE_OPTION_KEYS:
+            return await ask_remind_again(update, context, task,
+                                          "У задачи нет срока, этот вариант не подходит. "
+                                          "Выберите другой вариант.")
+        return await ask_remind_again(update, context, task, "Выберите другой вариант.")
+    label, when, note = options[key]
+    if when is not None and when <= now():
+        name = note[0].upper() + note[1:] if note else label  # «За неделю до срока»
+        return await ask_remind_again(update, context, task,
+                                      f"Время для варианта «{name}» уже прошло "
+                                      f"({fmt_when(when)}). Выберите другой вариант.")
+    if key == "custom":
+        prefix = context.user_data.get("remind_prefix", "") if update.callback_query else ""
+        await respond(update, context,
+                      f"{prefix}🕒 Напишите время: ЧЧ:ММ или ДД.ММ ЧЧ:ММ. {CUSTOM_TIME_EXAMPLE}")
+        return REMIND_TIME
+    user_id = update.effective_user.id
+    if key == "none":
+        if clear_reminder(context, user_id, task):
+            result = f"🔕 Напоминание о задаче #{task['id']} снято."
+        else:
+            result = "Ок, без напоминания."
+    else:
+        _, when, note = options[key]
+        result = set_reminder(context, user_id, task, when, note)
+    return await finish_remind_dialog(update, context, result)
+
+
+async def ask_remind_again(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           task: dict, warning: str) -> int:
+    """Выбранный вариант не подошёл: оставляем кнопки и объясняем почему."""
+    text = warning + due_options_note(task)
+    if update.callback_query:
+        # Сообщение с кнопками редактируется — сохраняем в нём, о какой задаче речь
+        prefix = context.user_data.get("remind_prefix") or f"{task_line(task)}\n\n"
+        text = prefix + text
+    await respond(update, context, text, remind_keyboard(remind_options(task)))
+    return REMIND_OPTION
+
+
+async def apply_custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            parts: list[str]) -> int:
+    """Напоминание на время, написанное текстом: «18:30» или «14.10 18:30»."""
+    task = task_in_remind_dialog(update, context)
+    if not task:
+        return await finish_remind_dialog(update, context, "Задача уже удалена или выполнена.")
+    when, error = parse_remind_moment(parts, CUSTOM_TIME_EXAMPLE)
+    if error:
+        await update.message.reply_text(error)
+        return REMIND_TIME
+    result = set_reminder(context, update.effective_user.id, task, when)
+    return await finish_remind_dialog(update, context, result)
+
+
+async def remind_time_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """После «Указать время»: ждём ЧЧ:ММ или ДД.ММ ЧЧ:ММ."""
+    parts = normalize(update.message.text).split()
+    if looks_like_time(parts):
+        return await apply_custom_time(update, context, parts)
+    if context.user_data.get("remind_after_add"):
+        return await close_question_after_add(update, context)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(f"Не понял время. {CUSTOM_TIME_EXAMPLE}")
+    return REMIND_TIME
+
+
+async def close_question_after_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Вместо ответа на «Напомнить о задаче?» написали новую задачу или команду:
+    молча закрываем вопрос и обрабатываем сообщение как обычно."""
+    await end_dialog_quietly(context)
+    return await quick_offer(update, context)
+
+
+async def reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки под напоминанием: «✅ Выполнено» и «⏰ Отложить на 1 час»."""
+    query = update.callback_query
+    await query.answer()
+    action, raw_id = query.data.split(":")
+    task_id = int(raw_id)
+    user_id = update.effective_user.id
+    task = find_task(get_user(context, user_id), task_id)
+
+    if not task:
+        await query.edit_message_text(f"Задача #{task_id} уже удалена.")
+        return
+    if task["status"] == "done":
+        await query.edit_message_text(f"✅ Задача #{task_id} уже выполнена.")
+        return
+
+    if action == "rdone":
+        complete_task(context, user_id, task)
+        await query.edit_message_text(f"✅ Задача #{task_id} выполнена: {task['text']}")
+    else:  # snooze
+        when = now() + timedelta(hours=1)
+        task["remind_at"] = when.isoformat(timespec="seconds")
+        task["remind_note"] = None
+        db.save_task(user_id, task)
+        schedule_reminder(context.job_queue, user_id, task)
+        await query.edit_message_text(f"{task_line(task)}\n⏰ Отложено, напомню {fmt_when(when)}")
+
+
+async def reminders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reminders — задачи с установленными напоминаниями, ближайшие первыми."""
+    user = get_user(context, update.effective_user.id)
+    tasks = [t for t in user["tasks"] if t["status"] == "active" and t.get("remind_at")]
+    if not tasks:
+        await update.message.reply_text("Напоминаний нет. Поставить: /remind")
+        return
+    tasks.sort(key=lambda t: datetime.fromisoformat(t["remind_at"]))
+    lines = []
+    for t in tasks:
+        line = f"{task_line(t)} — ⏰ {fmt_when(datetime.fromisoformat(t['remind_at']))}"
+        if t.get("remind_note"):
+            line += f" ({t['remind_note']})"  # например, «за сутки до срока»
+        lines.append(line)
+    await update.message.reply_text(join_lines(f"⏰ Напоминания ({len(tasks)}):\n", lines))
+
+
+DIGEST_EXAMPLE = ("Пример: /digest on, /digest off, /digest 08:30, "
+                  "/digest рабочие или /digest каждый день")
+# Режимы сводки: ключ хранится в базе (users.digest_mode)
+DIGEST_MODES = {"daily": "каждый день", "workdays": "только в рабочие дни"}
+DIGEST_MODE_BUTTONS = {"daily": "Каждый день", "workdays": "Только в рабочие дни"}
+DIGEST_MODE_WORDS = {"рабочие": "workdays", "рабочие дни": "workdays", "в рабочие дни": "workdays",
+                     "только в рабочие дни": "workdays", "workdays": "workdays",
+                     "каждый день": "daily", "ежедневно": "daily", "все дни": "daily",
+                     "daily": "daily"}
+
+
+def digest_status(settings: dict) -> str:
+    """«🔔 Сводка включена: приходит в 09:00, только в рабочие дни.»"""
+    if not settings["digest_enabled"]:
+        return "🔕 Ежедневная сводка выключена."
+    mode = DIGEST_MODES[settings["digest_mode"]]
+    return f"🔔 Сводка включена: приходит в {settings['digest_time']}, {mode}."
+
+
+def digest_keyboard(mode: str) -> InlineKeyboardMarkup:
+    """Кнопки режима, выбранный отмечен галочкой. Каждая кнопка — на всю строку:
+    «Только в рабочие дни» в две колонки не поместится."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(("✅ " if key == mode else "") + label, callback_data=f"dmode:{key}")]
+        for key, label in DIGEST_MODE_BUTTONS.items()
+    ])
+
+
+async def digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/digest — настройки и кнопки режима; /digest on|off, /digest 08:30,
+    /digest рабочие, /digest каждый день."""
+    user_id = update.effective_user.id
+    user = get_user(context, user_id)
+    settings = user["settings"]
+
+    if not context.args:
+        await update.message.reply_text(f"{digest_status(settings)}\n{DIGEST_EXAMPLE}",
+                                        reply_markup=digest_keyboard(settings["digest_mode"]))
+        return
+
+    wanted = " ".join(context.args).lower()
+    mode = match_phrase(wanted, DIGEST_MODE_WORDS)
+    if wanted == "off":
+        settings["digest_enabled"] = False
+        reply = "🔕 Ежедневная сводка выключена."
+    elif wanted == "on":
+        settings["digest_enabled"] = True
+        reply = digest_status(settings)
+    elif parse_time(wanted):
+        settings["digest_time"] = parse_time(wanted).strftime("%H:%M")
+        settings["digest_enabled"] = True
+        reply = f"🔔 Сводка будет приходить в {settings['digest_time']}, {DIGEST_MODES[settings['digest_mode']]}."
+    elif mode:
+        settings["digest_mode"] = mode
+        settings["digest_enabled"] = True
+        reply = f"🔔 Сводка будет приходить {DIGEST_MODES[mode]} в {settings['digest_time']}."
+    else:
+        await update.message.reply_text(f"Не понял параметр. {DIGEST_EXAMPLE}")
+        return
+
+    db.save_user(user)
+    schedule_digest(context.job_queue, user_id, user)
+    await update.message.reply_text(reply)
+
+
+async def digest_mode_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопки «Каждый день» / «Только в рабочие дни» под /digest. Выбор режима включает сводку."""
+    query = update.callback_query
+    await query.answer()
+    mode = query.data.split(":", 1)[1]
+    if mode not in DIGEST_MODES:
+        return
+    user_id = update.effective_user.id
+    user = get_user(context, user_id)
+    user["settings"]["digest_mode"] = mode
+    user["settings"]["digest_enabled"] = True
+    db.save_user(user)
+    schedule_digest(context.job_queue, user_id, user)
+    await query.edit_message_text(f"{digest_status(user['settings'])}\n{DIGEST_EXAMPLE}",
+                                  reply_markup=digest_keyboard(mode))
+
+
+# ---------------------------------------------------------------------------
+# Поиск и история
+# ---------------------------------------------------------------------------
+
+SEARCH_PROMPT = "🔍 Что найти? Напишите слово из задачи, например: отчёт"
+HISTORY_LIMIT = 10
+
+
+def done_date(task: dict) -> date | None:
+    return datetime.fromisoformat(task["done_at"]).date() if task.get("done_at") else None
+
+
+def search_tasks(user: dict, query: str) -> tuple[list[dict], bool]:
+    """Задачи, где встречаются все слова запроса. Сначала ищем точно (запросом к базе);
+    если ничего нет — слова с небольшими опечатками. Возвращает (задачи, точный ли поиск)."""
+    words = normalize(query).split()
+    found = db.search_tasks(user["user_id"], words)
+    if found:
+        return found, True
+
+    def similar(task: dict) -> bool:
+        task_words = re.findall(r"\w+", normalize(f"{task['text']} {task.get('category') or ''}"))
+        return all(any(edit_distance(w, tw) <= typo_limit(w) for tw in task_words) for w in words)
+
+    return [t for t in user["tasks"] if not t["archived"] and similar(t)], False
+
+
+async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/find <слово> — поиск по задачам. Без слова бот спросит, что искать."""
+    await end_dialog_quietly(context)
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.message.reply_text(SEARCH_PROMPT)
+        return FIND_QUERY
+    await send_search_results(update, context, query)
+    return ConversationHandler.END
+
+
+async def find_query_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ответ на «Что найти?». Любой текст подходит как запрос, поэтому сначала проверяем
+    текстовые команды («отмена», «список»), иначе их было бы не набрать."""
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await send_search_results(update, context, update.message.text)
+    return ConversationHandler.END
+
+
+async def send_search_results(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
+    query = " ".join(query.split())
+    user = get_user(context, update.effective_user.id)
+    tasks, exact = search_tasks(user, query)
+    if not tasks:
+        text = f"🔍 По запросу «{query}» ничего не нашлось."
+        source = context.user_data.get("text_command_source")
+        if source:  # «Найти ключи» могло быть задачей, а не поиском — подскажем, как её добавить
+            text += f"\nЕсли это задача, добавьте её так: /add {source}"
+        await update.message.reply_text(text)
+        return
+
+    active = sorted((t for t in tasks if t["status"] == "active"), key=sort_key)
+    done = sorted((t for t in tasks if t["status"] == "done"),
+                  key=lambda t: t.get("done_at") or "", reverse=True)
+    lines = [task_line(t) for t in active]
+    for t in done:
+        finished = done_date(t)
+        lines.append(f"✅ {task_line(t)}" + (f" — выполнена {fmt_date(finished)}" if finished else ""))
+    if exact:
+        header = f"🔍 Найдено по «{query}»: {len(tasks)}\n"
+    else:
+        header = f"🔍 Точных совпадений по «{query}» нет. Похожие задачи: {len(tasks)}\n"
+    await update.message.reply_text(join_lines(header, lines))
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/history — последние выполненные задачи."""
+    user = get_user(context, update.effective_user.id)
+    tasks = db.done_history(user["user_id"], HISTORY_LIMIT)
+    if not tasks:
+        if any(t["archived"] for t in user["tasks"]):  # выполненные есть, но их убрали из истории
+            await update.message.reply_text("📜 История пуста: выполненные задачи из неё убраны. "
+                                            "В /stats они по-прежнему учитываются.")
+        else:
+            await update.message.reply_text("📜 Выполненных задач пока нет. Отметить задачу: /done")
+        return
+    total = sum(1 for t in user["tasks"] if t["status"] == "done" and not t["archived"])
+    lines = []
+    for t in tasks:
+        finished, due = done_date(t), task_due(t)
+        line = f"✅ {fmt_date(finished)} — {task_line(t)}" if finished else f"✅ {task_line(t)}"
+        if finished and due and finished > due:
+            line += " (позже срока)"
+        lines.append(line)
+    header = f"📜 Последние выполненные задачи ({len(tasks)} из {total}):\n"
+    await update.message.reply_text(join_lines(header, lines), reply_markup=HISTORY_CLEAR_KEYBOARD)
+
+
+# --- Очистка истории ---------------------------------------------------------------
+# Задачи не удаляются, а помечаются archived = 1: они пропадают из /history и /find,
+# но /stats их по-прежнему считает, и статистика не обнуляется.
+
+HISTORY_KEEP_DAYS = 30
+HISTORY_CLEAR_KEYBOARD = InlineKeyboardMarkup([[
+    InlineKeyboardButton("Очистить всё", callback_data="hclear:all"),
+    InlineKeyboardButton(f"Старше {HISTORY_KEEP_DAYS} дней", callback_data="hclear:old"),
+]])
+HISTORY_CONFIRM_KEYBOARD = InlineKeyboardMarkup([[
+    InlineKeyboardButton("Да", callback_data="hconf:yes"),
+    InlineKeyboardButton("Нет", callback_data="hconf:no"),
+]])
+HISTORY_SCOPE_WORDS = {"все": "all", "всю": "all", "всю историю": "all", "очистить все": "all",
+                       f"старше {HISTORY_KEEP_DAYS} дней": "old", "старые": "old",
+                       "старше месяца": "old"}
+HISTORY_SCOPE_HINT = f"Напишите «всё» или «старше {HISTORY_KEEP_DAYS} дней», либо нажмите кнопку."
+CLEAR_WORDS = {**YES_NO_WORDS, "очистить": True, "удалить": True}
+
+
+def history_tasks_to_clear(user: dict, scope: str) -> list[dict]:
+    """Выполненные задачи, которые сейчас видны в истории: все или выполненные
+    больше 30 дней назад (scope = "all" или "old")."""
+    tasks = [t for t in user["tasks"] if t["status"] == "done" and not t["archived"]]
+    if scope == "old":
+        cutoff = now() - timedelta(days=HISTORY_KEEP_DAYS)
+        tasks = [t for t in tasks if t.get("done_at") and datetime.fromisoformat(t["done_at"]) < cutoff]
+    return tasks
+
+
+async def clear_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """«очистить историю» (или /clear_history): спрашиваем, что убрать, затем подтверждение."""
+    await end_dialog_quietly(context)
+    if context.args:
+        scope = match_phrase(" ".join(context.args), HISTORY_SCOPE_WORDS)
+        if scope:
+            return await ask_clear_confirm(update, context, scope)
+    user = get_user(context, update.effective_user.id)
+    if not history_tasks_to_clear(user, "all"):
+        await update.message.reply_text("📜 История и так пуста.")
+        return ConversationHandler.END
+    await respond(update, context, "🧹 Что убрать из истории?", HISTORY_CLEAR_KEYBOARD)
+    return HISTORY_SCOPE
+
+
+async def history_clear_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Кнопки «Очистить всё» / «Старше 30 дней» — под /history или под вопросом «Что убрать?».
+    Срабатывают и посреди другого диалога: он молча завершается."""
+    query = update.callback_query
+    await query.answer()
+    await end_dialog_quietly(context)
+    return await ask_clear_confirm(update, context, query.data.split(":", 1)[1])
+
+
+async def history_scope_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ответ текстом на «Что убрать из истории?»."""
+    scope = match_phrase(update.message.text, HISTORY_SCOPE_WORDS)
+    if scope:
+        return await ask_clear_confirm(update, context, scope)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(HISTORY_SCOPE_HINT)
+    return HISTORY_SCOPE
+
+
+async def ask_clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, scope: str) -> int:
+    """Перед очисткой спрашиваем «Да» / «Нет». Вопрос — отдельным сообщением,
+    чтобы список /history над ним не пропал."""
+    await drop_keyboard(context)
+    tasks = history_tasks_to_clear(get_user(context, update.effective_user.id), scope)
+    chat_id = update.effective_chat.id
+    if not tasks:
+        text = ("📜 История и так пуста." if scope == "all" else
+                f"📜 В истории нет задач, выполненных больше {HISTORY_KEEP_DAYS} дней назад.")
+        await context.bot.send_message(chat_id, text)
+        return ConversationHandler.END
+    what = ("все выполненные задачи" if scope == "all" else
+            f"задачи, выполненные больше {HISTORY_KEEP_DAYS} дней назад")
+    context.user_data["clear_scope"] = scope
+    message = await context.bot.send_message(
+        chat_id, f"🧹 Убрать из истории {what} ({len(tasks)})? В /stats они останутся.",
+        reply_markup=HISTORY_CONFIRM_KEYBOARD)
+    context.user_data["kb_message"] = (message.chat_id, message.message_id)
+    return HISTORY_CONFIRM
+
+
+async def history_confirm_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    return await history_clear_answer(update, context, query.data == "hconf:yes")
+
+
+async def history_confirm_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ответ текстом на «Убрать из истории…?»: «да», «очистить», «нет»…"""
+    yes = match_phrase(update.message.text, CLEAR_WORDS)
+    if yes is not None:
+        return await history_clear_answer(update, context, yes)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(YES_NO_HINT)
+    return HISTORY_CONFIRM
+
+
+async def history_clear_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, yes: bool) -> int:
+    scope = context.user_data.pop("clear_scope", None)
+    if not yes or scope is None:
+        await respond(update, context, "Ок, история не тронута.")
+        return ConversationHandler.END
+    user = get_user(context, update.effective_user.id)
+    tasks = history_tasks_to_clear(user, scope)
+    db.archive_tasks(user["user_id"], [t["id"] for t in tasks])
+    n = len(tasks)
+    await respond(update, context,
+                  f"🧹 Из истории {plural(n, 'убрана', 'убраны', 'убрано')} {n} "
+                  f"{plural(n, 'задача', 'задачи', 'задач')}. В /stats "
+                  f"{plural(n, 'она по-прежнему учитывается', 'они по-прежнему учитываются', 'они по-прежнему учитываются')}.")
+    return ConversationHandler.END
+
+
+
+
+# ---------------------------------------------------------------------------
+# Выгрузка и загрузка задач (CSV, открывается в Excel)
+# ---------------------------------------------------------------------------
+# Формат — как в data/sample_tasks.csv: UTF-8 с BOM (по нему Excel узнаёт кодировку),
+# разделитель «;» (его ждёт Excel с русскими настройками), даты ДД.ММ.ГГГГ.
+
+CSV_COLUMNS = ["номер", "задача", "приоритет", "категория", "срок", "статус", "создана", "выполнена"]
+STATUS_NAMES = {"active": "активна", "done": "выполнена"}
+STATUS_WORDS = {"активна": "active", "активная": "active", "активно": "active",
+                "выполнена": "done", "выполнено": "done", "выполненная": "done",
+                "active": "active", "done": "done"}
+IMPORT_PRIORITY_WORDS = {**PRIORITY_WORDS, "high": "high", "medium": "medium", "low": "low"}
+MAX_IMPORT_BYTES = 1_000_000  # 1 МБ — это десятки тысяч задач
+MAX_IMPORT_ROWS = 1000
+FORMULA_CHARS = ("=", "+", "-", "@")  # с этих символов Excel начинает формулу
+
+IMPORT_HELP = (
+    "Колонки в первой строке: номер;задача;приоритет;категория;срок;статус;создана;выполнена.\n"
+    "Обязательна только «задача», порядок колонок любой, разделитель «;» или «,».\n"
+    "Приоритет: высокий, средний или низкий (пусто — средний). Срок и даты: ДД.ММ.ГГГГ. "
+    "Статус: активна или выполнена (пусто — активна).\n"
+    "Номера из файла не используются — задачи получат новые номера."
+)
+
+
+def excel_safe(value: str) -> str:
+    """Excel считает формулой ячейку, которая начинается с = + - @. Чтобы задача
+    «-купить хлеб» не превратилась в формулу, ставим апостроф — Excel его не показывает."""
+    return f"'{value}" if value.startswith(FORMULA_CHARS) else value
+
+
+def from_excel_safe(value: str) -> str:
+    """Обратно к excel_safe: убираем апостроф перед = + - @."""
+    return value[1:] if len(value) > 1 and value[0] == "'" and value[1] in FORMULA_CHARS else value
+
+
+def ru_date(value: str | None) -> str:
+    """«2026-10-14» или «2026-10-14T15:56:33+03:00» -> «14.10.2026»."""
+    return datetime.fromisoformat(value).strftime("%d.%m.%Y") if value else ""
+
+
+def build_export_csv(tasks: list[dict]) -> bytes:
+    """Все задачи в CSV в формате sample_tasks.csv."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=";", lineterminator="\r\n")
+    writer.writerow(CSV_COLUMNS)
+    for t in sorted(tasks, key=lambda t: t["id"]):
+        writer.writerow([
+            t["id"], excel_safe(t["text"]), PRIORITIES[t["priority"]]["name"],
+            excel_safe(t.get("category") or ""), ru_date(t.get("due")), STATUS_NAMES[t["status"]],
+            ru_date(t.get("created_at")), ru_date(t.get("done_at")),
+        ])
+    return buffer.getvalue().encode("utf-8-sig")  # utf-8-sig добавляет BOM в начало файла
+
+
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/export — присылает файл со всеми задачами."""
+    tasks = get_user(context, update.effective_user.id)["tasks"]
+    if not tasks:
+        await update.message.reply_text("Задач пока нет — выгружать нечего. Добавить: /add")
+        return
+    active = sum(1 for t in tasks if t["status"] == "active")
+    await update.message.reply_document(
+        document=build_export_csv(tasks),
+        filename=f"remindly_{today().strftime('%Y-%m-%d')}.csv",
+        caption=(f"📤 Все задачи: {len(tasks)} (активных {active}, выполненных {len(tasks) - active}).\n"
+                 "Файл открывается в Excel. Его же можно загрузить обратно через /import."),
+    )
+
+
+async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/import — объясняет, какой файл прислать. Сам файл обрабатывает import_document."""
+    await update.message.reply_text(
+        f"📥 Пришлите CSV-файл с задачами — например, выгруженный через /export.\n\n{IMPORT_HELP}")
+
+
+def decode_file(raw: bytes) -> str:
+    """Текст файла: UTF-8 (так сохраняет /export и «CSV UTF-8» в Excel) или Windows-1251
+    (так сохраняет обычный «CSV» в Excel с русскими настройками)."""
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1251")
+
+
+def parse_import_date(value: str, what: str) -> tuple[date | None, str | None]:
+    """«25.10.2026» -> дата. Пустое значение — (None, None). Ошибка — (None, причина)."""
+    if not value:
+        return None, None
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4}|\d{2})", value)
+    if not m:
+        return None, f"неверный формат даты {what} «{value}» — нужно ДД.ММ.ГГГГ, например 25.10.2026"
+    year = int(m[3]) if len(m[3]) == 4 else 2000 + int(m[3])
+    try:
+        return date(year, int(m[2]), int(m[1])), None
+    except ValueError:
+        return None, f"несуществующая дата {what} «{value}»"
+
+
+def at_noon(d: date) -> str:
+    """Дата из файла -> время для базы. Полдень — чтобы дата не «съезжала» из-за часового пояса."""
+    return datetime.combine(d, time(12, 0), tzinfo=TZ).isoformat(timespec="seconds")
+
+
+def parse_import_row(cell, categories: list[str]) -> tuple[dict | None, str | None]:
+    """Одна строка файла -> поля задачи для базы или причина, почему строка пропущена.
+    cell("срок") возвращает значение колонки ('' — если колонки или значения нет)."""
+    text = from_excel_safe(" ".join(cell("задача").split()))
+    if not text:
+        return None, "нет текста задачи"
+    if len(text) > MAX_TASK_LENGTH:
+        return None, f"текст задачи длиннее {MAX_TASK_LENGTH} символов"
+
+    raw = cell("приоритет")
+    priority = match_phrase(raw, IMPORT_PRIORITY_WORDS) if raw else "medium"
+    if priority is None:
+        return None, f"неизвестный приоритет «{raw}» — нужно: высокий, средний или низкий"
+
+    raw = " ".join(from_excel_safe(cell("категория")).split())
+    category = (find_category(raw, categories) or raw) if raw else None
+    error = validate_category(category) if category else None
+    if error:
+        return None, f"неподходящая категория «{raw}»: {error[0].lower()}{error[1:].rstrip('.')}"
+
+    due, error = parse_import_date(cell("срок"), "срока")
+    if error:
+        return None, error
+
+    raw = cell("статус")
+    status = match_phrase(raw, STATUS_WORDS) if raw else "active"
+    if status is None:
+        return None, f"неизвестный статус «{raw}» — нужно: активна или выполнена"
+
+    created, error = parse_import_date(cell("создана"), "создания")
+    if error:
+        return None, error
+    finished, error = parse_import_date(cell("выполнена"), "выполнения")
+    if error:
+        return None, error
+
+    current = now().isoformat(timespec="seconds")
+    return {
+        "text": text,
+        "priority": priority,
+        "category": category,
+        "due": due.isoformat() if due else None,
+        "status": status,
+        "created_at": at_noon(created) if created else current,
+        # у выполненной задачи без даты выполнения ставим сегодняшнюю
+        "done_at": (at_noon(finished) if finished else current) if status == "done" else None,
+    }, None
+
+
+def import_key(task: dict) -> tuple:
+    """По этим полям узнаём, что задача уже есть: повторная загрузка файла не создаст дублей."""
+    return normalize(task["text"]), task.get("due"), task["status"]
+
+
+def parse_import_file(text: str, user: dict) -> tuple[list[dict], list[tuple[int, str]], list[int]]:
+    """Разбирает CSV. Возвращает задачи для добавления, строки с ошибками
+    (номер строки в файле, причина) и номера строк-повторов (такая задача уже есть).
+    Если файл не подходит целиком — ValueError с причиной."""
+    if not text.strip():
+        raise ValueError("файл пустой")
+    first_line = text.splitlines()[0]
+    # Excel с русскими настройками разделяет колонки «;», с английскими — «,»
+    delimiter = max([";", ",", "\t"], key=first_line.count)
+    try:
+        rows = list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
+    except csv.Error as e:
+        raise ValueError(f"файл не похож на CSV ({e})") from e
+
+    header = [normalize(name) for name in rows[0]]
+    if "задача" not in header:
+        raise ValueError("в первой строке нет колонки «задача»")
+    if len(rows) - 1 > MAX_IMPORT_ROWS:
+        raise ValueError(f"слишком много строк ({len(rows) - 1}), можно не больше {MAX_IMPORT_ROWS}")
+    columns = {name: header.index(name) for name in CSV_COLUMNS if name in header}
+
+    categories = user_categories(user["user_id"])
+    # Задачи, которые уже есть (в списке или выше в файле): повторы не добавляем
+    seen = {import_key(t) for t in user["tasks"]}
+    tasks, skipped, duplicates = [], [], []
+    for row_number, row in enumerate(rows[1:], start=2):  # строка 1 — заголовок
+        if not any(value.strip() for value in row):
+            continue  # пустые строки пропускаем молча
+
+        def cell(name: str) -> str:
+            index = columns.get(name)
+            return row[index].strip() if index is not None and index < len(row) else ""
+
+        task, reason = parse_import_row(cell, categories)
+        if not task:
+            skipped.append((row_number, reason))
+        elif import_key(task) in seen:
+            duplicates.append(row_number)
+        else:
+            seen.add(import_key(task))
+            tasks.append(task)
+            if task["category"] and not find_category(task["category"], categories):
+                categories.append(task["category"])  # новая категория — для следующих строк
+    return tasks, skipped, duplicates
+
+
+def compact_numbers(numbers: list[int]) -> str:
+    """[2, 3, 4, 7, 9, 10] -> «2–4, 7, 9–10»."""
+    parts, start = [], None
+    for i, n in enumerate(numbers):
+        start = n if start is None else start
+        if i + 1 == len(numbers) or numbers[i + 1] != n + 1:
+            parts.append(str(n) if start == n else f"{start}–{n}")
+            start = None
+    return ", ".join(parts)
+
+
+def import_report(file_name: str, added: list[dict], skipped: list[tuple[int, str]],
+                  duplicates: list[int], new_categories: list[str]) -> str:
+    """Итог загрузки: сколько задач добавлено, какие строки пропущены и почему."""
+    if added:
+        done = sum(1 for t in added if t["status"] == "done")
+        numbers = f"#{added[0]['id']}" + (f"–#{added[-1]['id']}" if len(added) > 1 else "")
+        text = (f"📥 Из файла «{file_name}» добавлено {len(added)} "
+                f"{plural(len(added), 'задача', 'задачи', 'задач')} ({numbers})")
+        text += f", из них выполненных — {done}." if done else "."
+    else:
+        text = f"📥 Из файла «{file_name}» не добавлено ни одной задачи."
+    if new_categories:
+        text += f"\n🏷 Новые категории: {', '.join(new_categories)}."
+    if duplicates:  # повторы — одной строкой, а не списком (например, если файл загрузили дважды)
+        text += (f"\n♻️ Уже есть в списке, пропущено {len(duplicates)} "
+                 f"{plural(len(duplicates), 'строка', 'строки', 'строк')} ({compact_numbers(duplicates)}).")
+    if skipped:
+        header = (f"{text}\n\n⚠️ Пропущено {len(skipped)} "
+                  f"{plural(len(skipped), 'строка', 'строки', 'строк')}:")
+        text = join_lines(header, [f"• строка {number}: {reason}" for number, reason in skipped])
+    return text
+
+
+async def import_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пользователь прислал файл — загружаем из него задачи."""
+    document = update.message.document
+    file_name = document.file_name or "файл"
+    if file_name.lower().endswith((".xlsx", ".xls")):
+        await update.message.reply_text(
+            "Это файл Excel. Сохраните его как CSV («Файл → Сохранить как → CSV UTF-8» "
+            "или «CSV (разделители — точка с запятой)») и пришлите снова.")
+        return
+    if not file_name.lower().endswith((".csv", ".txt")):
+        await update.message.reply_text(
+            "Чтобы загрузить задачи, пришлите CSV-файл — такой, как выдаёт /export. Подробнее: /import")
+        return
+    if document.file_size and document.file_size > MAX_IMPORT_BYTES:
+        await update.message.reply_text("Файл слишком большой: можно до 1 МБ.")
+        return
+
+    try:
+        telegram_file = await document.get_file()
+        raw = bytes(await telegram_file.download_as_bytearray())
+    except TelegramError as e:
+        logger.warning("Не удалось скачать файл для импорта: %s", e)
+        await update.message.reply_text("Не получилось скачать файл. Попробуйте отправить его ещё раз.")
+        return
+
+    user = get_user(context, update.effective_user.id)
+    try:
+        tasks, skipped, duplicates = parse_import_file(decode_file(raw), user)
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ Не получилось прочитать «{file_name}»: {e}.\n\n{IMPORT_HELP}")
+        return
+
+    categories_before = set(user_categories(user["user_id"]))
+    added = db.import_tasks(user["user_id"], tasks) if tasks else []
+    new_categories = [c for c in user_categories(user["user_id"]) if c not in categories_before]
+    await update.message.reply_text(import_report(file_name, added, skipped, duplicates, new_categories))
+
+
+# ---------------------------------------------------------------------------
+# Управление категориями (/categories)
+# ---------------------------------------------------------------------------
+# Список категорий с числом задач — обычное сообщение, его кнопки работают в любой момент.
+# Нажатие на свою категорию начинает короткий диалог: переименовать или удалить.
+# Базовые категории (BASE_CATEGORIES) кнопок не получают и не меняются.
+
+CATEGORY_ACTION_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("✏️ Переименовать", callback_data="cact:rename")],
+    [InlineKeyboardButton("🗑 Удалить", callback_data="cact:delete"),
+     InlineKeyboardButton("⬅️ Назад", callback_data="cact:back")],
+])
+CATEGORY_DELETE_KEYBOARD = InlineKeyboardMarkup([[
+    InlineKeyboardButton("Да", callback_data="cdel:yes"),
+    InlineKeyboardButton("Нет", callback_data="cdel:no"),
+]])
+CATEGORY_ACTION_WORDS = {"переименовать": "rename", "изменить": "rename", "удалить": "delete",
+                         "назад": "back"}
+CATEGORY_ACTION_HINT = "Нажмите кнопку или напишите: переименовать, удалить или назад."
+
+
+def category_tasks(user: dict, name: str | None) -> list[dict]:
+    """Все задачи пользователя в категории (активные и выполненные); None — без категории."""
+    key = normalize(name or "")
+    return [t for t in user["tasks"] if normalize(t.get("category") or "") == key]
+
+
+def tasks_count_text(tasks: list[dict]) -> str:
+    """«нет задач», «3 задачи», «3 задачи, активных 1»."""
+    if not tasks:
+        return "нет задач"
+    active = sum(1 for t in tasks if t["status"] == "active")
+    text = f"{len(tasks)} {plural(len(tasks), 'задача', 'задачи', 'задач')}"
+    return text if active == len(tasks) else f"{text}, активных {active}"
+
+
+def categories_overview(user: dict) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Текст со всеми категориями и числом задач, кнопки — только у своих категорий."""
+    lines = ["🏷 Категории", "", "Базовые (не меняются):"]
+    lines += [f"• {name} — {tasks_count_text(category_tasks(user, name))}" for name in BASE_CATEGORIES]
+    custom = db.custom_categories_with_ids(user["user_id"])
+    lines += ["", "Ваши:"]
+    if custom:
+        lines += [f"• {name} — {tasks_count_text(category_tasks(user, name))}" for _, name in custom]
+    else:
+        lines.append("пока нет. Новая категория появится, если на шаге «Категория» "
+                     "при добавлении задачи написать своё название.")
+    without = category_tasks(user, None)
+    if without:
+        lines += ["", f"Без категории — {tasks_count_text(without)}"]
+    if not custom:
+        return "\n".join(lines), None
+    lines += ["", "Нажмите на свою категорию, чтобы переименовать или удалить её."]
+    # В кнопке — rowid строки в таблице categories: он не меняется, даже если другие удалят
+    buttons = [InlineKeyboardButton(f"🏷 {name}", callback_data=f"catm:{rowid}") for rowid, name in custom]
+    return "\n".join(lines), InlineKeyboardMarkup(button_rows(buttons))
+
+
+async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE, prefix: str = "") -> None:
+    """Показывает список категорий: после нажатия кнопки — в том же сообщении, иначе — новым.
+    Это не вопрос диалога, поэтому кнопки списка не запоминаем в kb_message."""
+    text, keyboard = categories_overview(get_user(context, update.effective_user.id))
+    query = update.callback_query
+    if query:
+        await query.edit_message_text(prefix + text, reply_markup=keyboard)
+        if context.user_data.get("kb_message") == (query.message.chat_id, query.message.message_id):
+            context.user_data.pop("kb_message")
+    else:
+        await drop_keyboard(context)
+        await update.message.reply_text(prefix + text, reply_markup=keyboard)
+
+
+async def categories_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/categories (или «категории») — категории и сколько в них задач."""
+    await show_categories(update, context)
+
+
+async def category_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Нажата своя категория в списке: спрашиваем, что с ней сделать.
+    Срабатывает и посреди другого диалога — он молча завершается."""
+    query = update.callback_query
+    await query.answer()
+    await end_dialog_quietly(context)
+    name = db.custom_category_name(update.effective_user.id, int(query.data.split(":", 1)[1]))
+    if name is None:
+        await show_categories(update, context, "Этой категории уже нет.\n\n")
+        return ConversationHandler.END
+    context.user_data["cat_edit"] = name
+    user = get_user(context, update.effective_user.id)
+    await respond(update, context,
+                  f"🏷 {name} — {tasks_count_text(category_tasks(user, name))}\nЧто сделать с категорией?",
+                  CATEGORY_ACTION_KEYBOARD)
+    return CAT_ACTION
+
+
+async def category_action_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    return await category_action(update, context, query.data.split(":", 1)[1])
+
+
+async def category_action_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ответ текстом на «Что сделать с категорией?»."""
+    action = match_phrase(update.message.text, CATEGORY_ACTION_WORDS)
+    if action:
+        return await category_action(update, context, action)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(CATEGORY_ACTION_HINT)
+    return CAT_ACTION
+
+
+def managed_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """Своя категория, с которой сейчас работаем (None, если её уже удалили)."""
+    name = context.user_data.get("cat_edit")
+    custom = db.custom_categories(update.effective_user.id)
+    return name if name in custom else None
+
+
+async def category_action(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> int:
+    """Переименовать, удалить (с подтверждением) или вернуться к списку."""
+    name = managed_category(update, context)
+    if action == "back" or name is None:
+        context.user_data.pop("cat_edit", None)
+        await show_categories(update, context, "" if name else "Этой категории уже нет.\n\n")
+        return ConversationHandler.END
+    if action == "rename":
+        await respond(update, context, f"✏️ Новое название для категории «{name}»?")
+        return CAT_RENAME
+    tasks = category_tasks(get_user(context, update.effective_user.id), name)
+    if tasks:
+        moved = plural(len(tasks), "она перейдёт", "они перейдут", "они перейдут")
+        details = f"В ней {tasks_count_text(tasks)} — {moved} в «Без категории»."
+    else:
+        details = "Задач в ней нет."
+    await respond(update, context, f"🗑 Удалить категорию «{name}»? {details}", CATEGORY_DELETE_KEYBOARD)
+    return CAT_DELETE_CONFIRM
+
+
+async def category_rename_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Новое название категории. Любой текст подходит как ответ, поэтому сначала проверяем
+    текстовые команды («отмена»), иначе их было бы не набрать."""
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    old = managed_category(update, context)
+    if old is None:
+        context.user_data.pop("cat_edit", None)
+        await show_categories(update, context, "Этой категории уже нет.\n\n")
+        return ConversationHandler.END
+    new, error = clean_category_name(update.message.text)
+    if not error and new == old:
+        error = "Это то же название."
+    taken = [c for c in user_categories(update.effective_user.id)
+             if normalize(c) == normalize(new) and c != old]
+    if not error and taken:
+        error = f"Категория «{taken[0]}» уже есть."
+    if error:
+        await update.message.reply_text(f"{error} Напишите другое название или /cancel.")
+        return CAT_RENAME
+
+    count = db.rename_category(update.effective_user.id, old, new)
+    context.user_data.pop("cat_edit", None)
+    await show_categories(update, context,
+                          f"✏️ Категория «{old}» переименована в «{new}». Изменено задач: {count}.\n\n")
+    return ConversationHandler.END
+
+
+async def category_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    return await category_delete_answer(update, context, query.data == "cdel:yes")
+
+
+async def category_delete_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ответ текстом на «Удалить категорию?»: «да», «удалить», «нет», «оставить»…"""
+    yes = match_phrase(update.message.text, DELETE_WORDS)
+    if yes is not None:
+        return await category_delete_answer(update, context, yes)
+    state = await try_text_command(update, context)
+    if state is not None:
+        return state
+    await update.message.reply_text(YES_NO_HINT)
+    return CAT_DELETE_CONFIRM
+
+
+async def category_delete_answer(update: Update, context: ContextTypes.DEFAULT_TYPE, yes: bool) -> int:
+    """Удаляем категорию: её задачи переходят в «Без категории»."""
+    name = managed_category(update, context)
+    context.user_data.pop("cat_edit", None)
+    if name is None:
+        await show_categories(update, context, "Этой категории уже нет.\n\n")
+    elif not yes:
+        await show_categories(update, context, f"Ок, категория «{name}» остаётся.\n\n")
+    else:
+        count = db.delete_category(update.effective_user.id, name)
+        moved = (f" {count} {plural(count, 'задача', 'задачи', 'задач')} теперь без категории."
+                 if count else "")
+        await show_categories(update, context, f"🗑 Категория «{name}» удалена.{moved}\n\n")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Статистика и служебные команды
+# ---------------------------------------------------------------------------
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats — сводные цифры."""
+    tasks = get_user(context, update.effective_user.id)["tasks"]
+    active = [t for t in tasks if t["status"] == "active"]
+    done = [t for t in tasks if t["status"] == "done"]
+    overdue = [t for t in active if is_overdue(t)]
+
+    # «В срок» считаем среди выполненных задач, у которых был срок
+    done_with_due = [t for t in done if t.get("due")]
+    on_time = [
+        t for t in done_with_due
+        if datetime.fromisoformat(t["done_at"]).date() <= task_due(t)
+    ]
+    on_time_text = (f"{round(100 * len(on_time) / len(done_with_due))}%"
+                    if done_with_due else "— (нет выполненных задач со сроком)")
+
+    await update.message.reply_text(
+        "📊 Статистика\n\n"
+        f"Всего задач: {len(tasks)}\n"
+        f"Активных: {len(active)}\n"
+        f"Выполненных: {len(done)}\n"
+        f"Просроченных: {len(overdue)}\n"
+        f"Выполнено в срок: {on_time_text}"
+    )
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — приветствие. Новому пользователю включается сводка (см. get_user)."""
+    user = get_user(context, update.effective_user.id)
+    user["chat_id"] = update.effective_chat.id
+    db.save_user(user)
+    await update.message.reply_text(
+        f"👋 Привет, {update.effective_user.first_name}! Я Remindly — помогу не забывать о делах.\n\n"
+        "• Напишите задачу текстом или используйте /add\n"
+        "• /list — все задачи, /today — на сегодня\n"
+        "• /remind 3 18:30 — напомню о задаче #3\n"
+        f"• {'По рабочим дням' if user['settings']['digest_mode'] == 'workdays' else 'Каждый день'} "
+        f"в {user['settings']['digest_time']} пришлю сводку. Все команды — /help"
+    )
+
+
+HELP_TEXT = """📖 Команды Remindly
+
+Задачи
+/add — добавить задачу: текст → приоритет → срок → категория
+/add Купить хлеб — то же, но сразу с текстом
+/list — активные задачи и кнопки фильтров
+/list высокий, /list рабочие, /list неделя — сразу с фильтром
+/today — задачи на сегодня и просроченные
+/find отчёт — найти задачи по слову
+/history — последние выполненные задачи; под списком кнопки «Очистить всё»
+и «Старше 30 дней» (задачи пропадут из истории и поиска, но останутся в /stats)
+/edit — выбрать задачу кнопками и изменить текст, приоритет, срок или категорию
+/edit 3 — изменить задачу #3
+/done — выбрать задачу кнопками и отметить выполненной
+/done 3 — отметить задачу #3 выполненной
+/delete — выбрать задачу кнопками и удалить
+/delete 3 — удалить задачу #3
+/categories — категории и сколько в них задач; свои можно переименовать и удалить
+/stats — статистика
+
+Напоминания
+/remind — выбрать задачу кнопками и вариант напоминания
+/remind 3 — варианты напоминания для задачи #3
+/remind 3 18:30 — напомнить сегодня (если время прошло — завтра)
+/remind 3 14.10 18:30 — напомнить в конкретный день
+/reminders — задачи с напоминаниями
+/digest — настройки сводки и кнопки «Каждый день» / «Только в рабочие дни»
+/digest on / /digest off — включить / выключить сводку
+/digest 08:30 — изменить время сводки
+/digest рабочие — сводка только в рабочие дни (без выходных и праздников)
+
+Файлы и календарь
+/export — выгрузить все задачи в файл для Excel
+/import — загрузить задачи из CSV-файла (можно просто прислать файл)
+/workdays — сколько рабочих дней осталось до конца месяца
+
+/cancel — прервать текущий диалог
+
+💬 Команды можно писать и обычным текстом:
+«список», «лист», «задачи», «мои задачи» — /list
+«список рабочие», «список высокий», «список неделя» — /list с фильтром
+«сегодня», «на сегодня» — /today
+«найти отчёт», «найти» — /find
+«категории» — /categories
+«история» — /history
+«очистить историю» — убрать выполненные задачи из истории
+«напоминания» — /reminders
+«статистика» — /stats
+«экспорт», «импорт» — /export, /import
+«рабочие дни» — /workdays
+«помощь», «команды» — /help
+«сводка», «сводка вкл», «сводка выкл», «сводка 08:30» — /digest
+«сводка рабочие», «сводка каждый день» — режим сводки
+«добавить», «добавить Купить хлеб» — /add
+«готово», «выполнено», «сделано» (можно с номером: «готово 3») — /done
+«удалить», «удалить 3» — /delete
+«изменить 3», «редактировать 3» — /edit 3
+«напомни», «напомни 3», «напомни 3 18:30», «напомни 3 14.10 18:30» — /remind
+«отмена» — /cancel
+«привет», «здравствуйте», «начать» — /start
+
+📅 Срок можно задать в рабочих днях: «через 5 рабочих дней» — я посчитаю дату по
+производственному календарю и предупрежу, если срок выпадает на выходной или праздник.
+
+🏷 Категории: Рабочие, Бытовые, Учебные, Личные или своя — просто напишите её название.
+Свои категории можно переименовать или удалить в /categories (задачи из удалённой
+категории останутся без категории).
+
+⏰ Варианты напоминания: через час, завтра в 10:00, через неделю; если у задачи есть срок —
+ещё в день срока, за сутки, за неделю и за месяц до срока (в 10:00). Всегда можно указать
+время или отказаться. После добавления задачи я сам предложу поставить напоминание.
+
+🔁 Если такая задача уже есть среди активных, я переспрошу, создавать ли ещё одну.
+
+💡 Любой другой текст я предложу сохранить как задачу.
+На вопросы с кнопками можно отвечать текстом: «да», «высокий», «завтра», «14.10».
+Небольшие опечатки не страшны: «звтра», «срдений», «спсок»."""
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(HELP_TEXT)
+
+
+async def unknown_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Не знаю такую команду 🤔 Список команд — /help")
+
+
+async def stale_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Нажата кнопка от завершённого диалога (например, после перезапуска бота)."""
+    await update.callback_query.answer(
+        "Эта кнопка устарела. Начните заново: /add или просто напишите задачу.", show_alert=True
+    )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик ошибок: пишем в лог и вежливо сообщаем пользователю."""
+    if isinstance(context.error, BadRequest) and "not modified" in str(context.error):
+        return  # повторное нажатие той же кнопки — не ошибка
+    logger.error("Ошибка при обработке апдейта", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                update.effective_chat.id, "😕 Что-то пошло не так. Попробуйте ещё раз."
+            )
+        except TelegramError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Запуск
+# ---------------------------------------------------------------------------
+
+BOT_COMMANDS = [
+    BotCommand("add", "Добавить задачу"),
+    BotCommand("list", "Все активные задачи"),
+    BotCommand("today", "Задачи на сегодня"),
+    BotCommand("edit", "Изменить задачу"),
+    BotCommand("done", "Отметить задачу выполненной"),
+    BotCommand("delete", "Удалить задачу"),
+    BotCommand("remind", "Поставить напоминание"),
+    BotCommand("reminders", "Задачи с напоминаниями"),
+    BotCommand("find", "Найти задачи по слову"),
+    BotCommand("history", "Последние выполненные задачи"),
+    BotCommand("categories", "Категории: переименовать, удалить"),
+    BotCommand("export", "Выгрузить задачи в файл для Excel"),
+    BotCommand("import", "Загрузить задачи из CSV-файла"),
+    BotCommand("workdays", "Рабочие дни до конца месяца"),
+    BotCommand("digest", "Сводка: время, режим, вкл / выкл"),
+    BotCommand("stats", "Статистика"),
+    BotCommand("help", "Список команд"),
+    BotCommand("cancel", "Прервать диалог"),
+    BotCommand("start", "Начать"),
+]
+
+
+# Обычные команды: имя -> обработчик. Используются и для команд со слешем, и для текстовых.
+COMMAND_HANDLERS = {
+    "start": start_cmd,
+    "help": help_cmd,
+    "list": list_cmd,
+    "today": today_cmd,
+    "reminders": reminders_cmd,
+    "digest": digest_cmd,
+    "stats": stats_cmd,
+    "history": history_cmd,
+    "export": export_cmd,
+    "import": import_cmd,
+    "workdays": workdays_cmd,
+    "categories": categories_cmd,
+}
+
+# Команды, которые сами начинают или завершают диалог (обрабатываются в ConversationHandler)
+DIALOG_COMMAND_HANDLERS = {
+    "add": add_start,
+    "edit": edit_cmd,
+    "done": done_cmd,
+    "delete": delete_cmd,
+    "remind": remind_cmd,
+    "find": find_cmd,
+    "clear_history": clear_history_cmd,  # «очистить историю»
+    "cancel": cancel,
+}
+
+
+async def post_init(application: Application) -> None:
+    """Выполняется один раз после запуска: меню команд и восстановление задач планировщика."""
+    await application.bot.set_my_commands(BOT_COMMANDS)
+    restore_jobs(application)
+
+
+def build_application() -> Application:
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .defaults(Defaults(tzinfo=TZ))
+        .post_init(post_init)
+        .build()
+    )
+
+    text_only = filters.TEXT & ~filters.COMMAND
+
+    # Обработчики разбиты на две группы. В каждой группе срабатывает максимум один обработчик,
+    # но группы проверяются по очереди. Поэтому команда посреди диалога сначала молча
+    # завершает диалог (группа 0), а потом выполняется как обычно (группа 1).
+
+    # --- Группа 0: диалоги и кнопки ---
+    dialog = ConversationHandler(
+        entry_points=[
+            *(CommandHandler(name, callback) for name, callback in DIALOG_COMMAND_HANDLERS.items()),
+            CallbackQueryHandler(history_clear_button, pattern=r"^hclear:"),  # кнопки под /history
+            CallbackQueryHandler(category_menu_button, pattern=r"^catm:"),  # кнопки под /categories
+            MessageHandler(text_only, quick_offer),  # быстрое добавление
+        ],
+        states={
+            CONFIRM: [
+                CallbackQueryHandler(quick_button, pattern=r"^quick:"),
+                MessageHandler(text_only, quick_text),
+            ],
+            TEXT: [MessageHandler(text_only, add_text)],
+            PRIORITY: [
+                CallbackQueryHandler(priority_button, pattern=r"^prio:"),
+                MessageHandler(text_only, priority_text),
+            ],
+            DUE: [
+                CallbackQueryHandler(due_button, pattern=r"^due:"),
+                MessageHandler(text_only, due_text),
+            ],
+            DATE_INPUT: [MessageHandler(text_only, date_entered)],
+            WORKDAYS_INPUT: [MessageHandler(text_only, workdays_entered)],
+            CATEGORY: [
+                CallbackQueryHandler(category_button, pattern=r"^cat:"),
+                MessageHandler(text_only, category_text),
+            ],
+            DELETE_CONFIRM: [
+                CallbackQueryHandler(delete_button, pattern=r"^del:"),
+                MessageHandler(text_only, delete_text),
+            ],
+            PICK_TASK: [
+                CallbackQueryHandler(pick_button, pattern=r"^pick:"),
+                MessageHandler(text_only, pick_text),
+            ],
+            REMIND_OPTION: [
+                CallbackQueryHandler(remind_option_button, pattern=r"^ropt:"),
+                MessageHandler(text_only, remind_option_text),
+            ],
+            REMIND_TIME: [MessageHandler(text_only, remind_time_text)],
+            FIND_QUERY: [MessageHandler(text_only, find_query_text)],
+            DUPLICATE: [
+                CallbackQueryHandler(duplicate_button, pattern=r"^dup:"),
+                MessageHandler(text_only, duplicate_text),
+            ],
+            EDIT_FIELD: [
+                CallbackQueryHandler(edit_field_button, pattern=r"^efield:"),
+                MessageHandler(text_only, edit_field_text),
+            ],
+            HISTORY_SCOPE: [MessageHandler(text_only, history_scope_text)],  # кнопки — в fallbacks
+            CAT_ACTION: [
+                CallbackQueryHandler(category_action_button, pattern=r"^cact:"),
+                MessageHandler(text_only, category_action_text),
+            ],
+            CAT_RENAME: [MessageHandler(text_only, category_rename_text)],
+            CAT_DELETE_CONFIRM: [
+                CallbackQueryHandler(category_delete_button, pattern=r"^cdel:"),
+                MessageHandler(text_only, category_delete_text),
+            ],
+            HISTORY_CONFIRM: [
+                CallbackQueryHandler(history_confirm_button, pattern=r"^hconf:"),
+                MessageHandler(text_only, history_confirm_text),
+            ],
+            ConversationHandler.TIMEOUT: [TypeHandler(Update, dialog_timeout)],
+        },
+        fallbacks=[
+            # /add, /edit, /done, /delete, /remind, /find, /cancel посреди диалога начинают новый
+            *(CommandHandler(name, callback) for name, callback in DIALOG_COMMAND_HANDLERS.items()),
+            CallbackQueryHandler(history_clear_button, pattern=r"^hclear:"),
+            CallbackQueryHandler(category_menu_button, pattern=r"^catm:"),
+            MessageHandler(filters.COMMAND, end_on_command),  # остальные команды — см. группу 1
+        ],
+        conversation_timeout=DIALOG_TIMEOUT,
+    )
+    application.add_handler(dialog)
+
+    # Кнопки, нажатые вне диалога
+    application.add_handler(CallbackQueryHandler(delete_button, pattern=r"^del:"))
+    application.add_handler(CallbackQueryHandler(reminder_callback, pattern=r"^(rdone|snooze):"))
+    application.add_handler(CallbackQueryHandler(list_filter_button, pattern=r"^flt:"))
+    application.add_handler(CallbackQueryHandler(digest_mode_button, pattern=r"^dmode:"))
+    application.add_handler(CallbackQueryHandler(stale_button))
+
+    # Файл от пользователя — загрузка задач (/import)
+    application.add_handler(MessageHandler(filters.Document.ALL, import_document))
+
+    # --- Группа 1: обычные команды (команды из DIALOG_COMMAND_HANDLERS обрабатывает диалог) ---
+    for name, callback in COMMAND_HANDLERS.items():
+        application.add_handler(CommandHandler(name, callback), group=1)
+
+    # Неизвестная команда — последней. Команды диалога исключаем, иначе ответ придёт дважды.
+    dialog_commands = filters.Regex(rf"^/({'|'.join(DIALOG_COMMAND_HANDLERS)})(@\w+)?(\s|$)")
+    application.add_handler(MessageHandler(filters.COMMAND & ~dialog_commands, unknown_cmd), group=1)
+
+    application.add_error_handler(error_handler)
+    return application
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("Не задан BOT_TOKEN. Скопируйте .env.example в .env и впишите токен.")
+    db.migrate_from_json(JSON_FILE)  # только при первом запуске, если есть старый tasks.json
+    logger.info("Remindly запускается. База: %s, календарь: %s", DB_FILE, CALENDAR_URL)
+    build_application().run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
