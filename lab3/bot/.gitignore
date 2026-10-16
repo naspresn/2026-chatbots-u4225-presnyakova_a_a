@@ -1,0 +1,20 @@
+# Секреты: токен бота и ID администратора. На Railway они задаются в переменных сервиса
+.env
+
+# База и её служебные файлы. На Railway база лежит на подключённом диске (volume)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+tasks.json
+tasks.json.migrated
+
+# Виртуальное окружение и кэш Python — на сервере Railway собирает всё заново
+.venv/
+__pycache__/
+*.pyc
+
+# Файлы редакторов и macOS
+.idea/
+.vscode/
+.DS_Store

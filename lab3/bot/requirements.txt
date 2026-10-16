@@ -1,0 +1,6 @@
+# job-queue — напоминания и сводки по расписанию; webhooks — веб-сервер для режима webhook (Railway)
+python-telegram-bot[job-queue,webhooks]>=21.0,<23.0
+python-dotenv>=1.0
+tzdata>=2024.1
+# HTTP-клиент для производственного календаря isdayoff.ru (он же нужен python-telegram-bot)
+httpx>=0.27
